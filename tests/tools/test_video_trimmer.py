@@ -2254,3 +2254,663 @@ def test_concat_cleanup_v2_speed_unchanged(tmp_path: Path, dense_av: Path):
     streams = _streams_of(out)
     assert "video" in streams and "audio" in streams
     assert result.data["speed_factor"] == 2.0
+
+
+# ------------------------------------------------------------------
+# v3: explicit concat temp ownership (O1), malformed-segment authority
+# (O2), cleanup exception-text diagnostics (O3), partial final output
+# handling (O4). _cut/_speed semantics must be unchanged.
+# ------------------------------------------------------------------
+
+
+def test_concat_ownership_v3_original_in_tempdir_never_deleted(tmp_path: Path):
+    """v3.1 (O1): an original input inside .concat_tmp is never deleted."""
+    from tools.base_tool import ToolResult
+
+    tmpdir = tmp_path / ".concat_tmp"
+    tmpdir.mkdir(parents=True)
+    orig = tmpdir / "seg_0000.mp4"  # collision-prone name, IS the input
+    orig.write_bytes(b"ORIGINAL-BYTES-MUST-SURVIVE")
+    b = tmp_path / "b.mp4"
+    b.write_bytes(b"fake-b")
+    out = tmp_path / "out.mp4"
+
+    def fail_cut(self, inputs):
+        return ToolResult(success=False, error="simulated trim failure", data={})
+
+    import unittest.mock as mock
+
+    with mock.patch.object(VideoTrimmer, "_cut", fail_cut):
+        result = VideoTrimmer().execute(
+            {
+                "operation": "concat",
+                "output_path": str(out),
+                "segments": [
+                    {"input_path": str(orig), "start_seconds": 0, "end_seconds": 1},
+                    {"input_path": str(b), "start_seconds": 0, "end_seconds": 1},
+                ],
+            }
+        )
+    assert not result.success
+    assert result.data["failed_segment_index"] == 0
+    assert orig.is_file(), "original input must never be deleted by cleanup"
+    assert orig.read_bytes() == b"ORIGINAL-BYTES-MUST-SURVIVE"
+    owned = [d["path"] for d in result.data["temp_file_details"]]
+    assert str(orig) not in owned, "original must never be cleanup-owned"
+    assert b.is_file()
+
+
+def test_concat_ownership_v3_collision_resolves_safely(tmp_path: Path):
+    """v3.2 (O1): original/temp filename collision resolves safely."""
+    from tools.base_tool import ToolResult
+
+    tmpdir = tmp_path / ".concat_tmp"
+    tmpdir.mkdir(parents=True)
+    orig = tmpdir / "seg_0000.mp4"
+    orig.write_bytes(b"ORIGINAL-BYTES-MUST-SURVIVE")
+    out = tmp_path / "out.mp4"
+    cut_outputs: list[str] = []
+
+    def ok_cut(self, inputs):
+        cut_outputs.append(str(inputs["output_path"]))
+        p = Path(inputs["output_path"])
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"good-temp")
+        return ToolResult(success=True, data={"operation": "cut"})
+
+    import unittest.mock as mock
+
+    with mock.patch.object(VideoTrimmer, "_cut", ok_cut), mock.patch.object(
+        VideoTrimmer, "run_command", lambda self, cmd, **kw: None
+    ):
+        result = VideoTrimmer().execute(
+            {
+                "operation": "concat",
+                "output_path": str(out),
+                "segments": [
+                    {"input_path": str(orig), "start_seconds": 0, "end_seconds": 1}
+                ],
+            }
+        )
+    assert result.success, result.error
+    assert len(cut_outputs) == 1
+    assert cut_outputs[0] != str(orig), "temp must not reuse the original path"
+    assert "seg_0000" in cut_outputs[0], "historical temp shape preserved"
+    assert orig.is_file()
+    assert orig.read_bytes() == b"ORIGINAL-BYTES-MUST-SURVIVE"
+    # Only the original matches the glob; the reserved temp is gone.
+    assert [p for p in tmp_path.rglob("seg_*.mp4")] == [orig]
+    assert sorted(tmpdir.iterdir()) == [orig]
+
+
+def test_concat_ownership_v3_malformed_empty_dict_structured(tmp_path: Path):
+    """v3.3 (O2): segments=[{}] returns structured failure, no leak."""
+    out = tmp_path / "out.mp4"
+    result = VideoTrimmer().execute(
+        {"operation": "concat", "output_path": str(out), "segments": [{}]}
+    )
+    assert not result.success
+    assert "malformed" in (result.error or "").lower()
+    assert result.data["failed_segment_index"] == 0
+    assert result.data["malformed_segment"] is True
+    assert result.data["final_output_created"] is False
+    assert result.data["cleanup_attempted"] is True
+    assert result.data["temp_dir_exists_after"] is False
+    assert result.data["cleanup_remaining_paths"] == []
+    assert not (tmp_path / ".concat_tmp").exists()
+    assert not out.exists()
+
+
+def test_concat_ownership_v3_malformed_nondict_structured(tmp_path: Path):
+    """v3.4 (O2): non-dict segments return structured failure."""
+    out = tmp_path / "out.mp4"
+    for bad in ("not-a-dict", None, 123, ["input_path"]):
+        result = VideoTrimmer().execute(
+            {
+                "operation": "concat",
+                "output_path": str(out),
+                "segments": [bad],
+            }
+        )
+        assert not result.success, f"segment {bad!r} must fail"
+        assert result.data["failed_segment_index"] == 0
+        assert result.data["malformed_segment"] is True
+        assert result.data["final_output_created"] is False
+    assert not (tmp_path / ".concat_tmp").exists()
+
+
+def test_concat_ownership_v3_malformed_first_leaves_no_tempdir(tmp_path: Path):
+    """v3.5 (O2+lifecycle): malformed first segment leaves no temp dir."""
+    out = tmp_path / "out.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [{"no_input": 1}],
+        }
+    )
+    assert not result.success
+    assert "missing" in (result.data["segment_error"] or "").lower()
+    assert result.data["failed_segment_index"] == 0
+    assert not (tmp_path / ".concat_tmp").exists()
+    assert result.data["temp_dir_exists_after"] is False
+    assert result.data["cleanup_ok"] is True
+
+
+def test_concat_ownership_v3_malformed_middle_cleans_owned_temps(
+    tmp_path: Path, monkeypatch
+):
+    """v3.6 (O2): malformed middle segment cleans earlier owned temps."""
+    from tools.base_tool import ToolResult
+
+    a = tmp_path / "a.mp4"
+    b = tmp_path / "b.mp4"
+    a.write_bytes(b"fake-a")
+    b.write_bytes(b"fake-b")
+    out = tmp_path / "out.mp4"
+
+    def fake_cut(self, inputs):
+        p = Path(inputs["output_path"])
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"good-temp")
+        return ToolResult(success=True, data={"operation": "cut"})
+
+    monkeypatch.setattr(VideoTrimmer, "_cut", fake_cut)
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {"input_path": str(a), "start_seconds": 0, "end_seconds": 1},
+                {"input_path": str(b), "start_seconds": 0, "end_seconds": 1},
+                {},
+            ],
+        }
+    )
+    assert not result.success
+    assert result.data["failed_segment_index"] == 2
+    assert result.data["malformed_segment"] is True
+    assert result.data["final_output_created"] is False
+    assert list(tmp_path.rglob("seg_*.mp4")) == []
+    assert not (tmp_path / ".concat_tmp").exists()
+    assert a.is_file() and b.is_file()
+
+
+def test_concat_ownership_v3_malformed_index_correct(tmp_path: Path):
+    """v3.7 (O2): unusable input_path reports the correct segment index."""
+    a = tmp_path / "a.mp4"
+    b = tmp_path / "b.mp4"
+    a.write_bytes(b"fake-a")
+    b.write_bytes(b"fake-b")
+    out = tmp_path / "out.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {"input_path": str(a)},
+                {"input_path": str(b)},
+                {"input_path": None},
+            ],
+        }
+    )
+    assert not result.success
+    assert result.data["failed_segment_index"] == 2
+    assert "unusable" in (result.data["segment_error"] or "").lower()
+    assert a.is_file() and b.is_file()
+    assert not (tmp_path / ".concat_tmp").exists()
+
+
+def test_concat_ownership_v3_no_join_after_malformed(tmp_path: Path, monkeypatch):
+    """v3.8 (O2): the final join never runs after a malformed segment."""
+    real_run = VideoTrimmer.run_command
+    calls: list[list[str]] = []
+
+    def spy_run(self, cmd: list[str], **kwargs):
+        calls.append(list(cmd))
+        return real_run(self, cmd, **kwargs)
+
+    monkeypatch.setattr(VideoTrimmer, "run_command", spy_run)
+    a = tmp_path / "a.mp4"
+    a.write_bytes(b"fake-a")
+    out = tmp_path / "out.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [{"input_path": str(a)}, {}],
+        }
+    )
+    assert not result.success
+    assert result.data["failed_segment_index"] == 1
+    assert not any("concat" in c for c in calls)
+    assert not out.exists()
+
+
+def test_concat_ownership_v3_unlink_oserror_preserves_text(
+    tmp_path: Path, monkeypatch
+):
+    """v3.9 (O3): cleanup unlink OSError preserves exception type/text."""
+    from tools.base_tool import ToolResult
+
+    a = tmp_path / "a.mp4"
+    b = tmp_path / "b.mp4"
+    a.write_bytes(b"fake-a")
+    b.write_bytes(b"fake-b")
+    out = tmp_path / "out.mp4"
+
+    def fake_cut(self, inputs):
+        op = str(inputs["output_path"])
+        if "seg_0001" in op:
+            return ToolResult(
+                success=False,
+                error="simulated primary trim failure",
+                data={"operation": "cut"},
+            )
+        p = Path(inputs["output_path"])
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"good-temp")
+        return ToolResult(success=True, data={"operation": "cut"})
+
+    def boom_unlink(self, *args, **kwargs):
+        raise OSError("boom-unlink-v3")
+
+    monkeypatch.setattr(VideoTrimmer, "_cut", fake_cut)
+    monkeypatch.setattr(Path, "unlink", boom_unlink)
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {"input_path": str(a), "start_seconds": 0, "end_seconds": 1},
+                {"input_path": str(b), "start_seconds": 0, "end_seconds": 1},
+            ],
+        }
+    )
+    assert not result.success
+    assert "simulated primary trim failure" in (result.error or "")
+    assert "boom-unlink-v3" not in (result.error or "")
+    assert result.data["cleanup_ok"] is False
+    assert "OSError" in (result.data["cleanup_error"] or "")
+    assert "boom-unlink-v3" in (result.data["cleanup_error"] or "")
+    details = result.data["temp_file_details"]
+    assert any(d.get("error_type") == "OSError" for d in details)
+    assert any("boom-unlink-v3" in (d.get("error_message") or "") for d in details)
+    assert a.is_file() and b.is_file()
+
+
+def test_concat_ownership_v3_rmdir_oserror_preserves_text(
+    tmp_path: Path, monkeypatch
+):
+    """v3.10 (O3): cleanup rmdir OSError preserves exception type/text."""
+    from tools.base_tool import ToolResult
+
+    a = tmp_path / "a.mp4"
+    b = tmp_path / "b.mp4"
+    a.write_bytes(b"fake-a")
+    b.write_bytes(b"fake-b")
+    out = tmp_path / "out.mp4"
+
+    def fake_cut(self, inputs):
+        op = str(inputs["output_path"])
+        if "seg_0001" in op:
+            return ToolResult(
+                success=False,
+                error="simulated primary trim failure",
+                data={"operation": "cut"},
+            )
+        p = Path(inputs["output_path"])
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"good-temp")
+        return ToolResult(success=True, data={"operation": "cut"})
+
+    def boom_rmdir(self):
+        raise OSError("boom-rmdir-v3")
+
+    monkeypatch.setattr(VideoTrimmer, "_cut", fake_cut)
+    monkeypatch.setattr(Path, "rmdir", boom_rmdir)
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {"input_path": str(a), "start_seconds": 0, "end_seconds": 1},
+                {"input_path": str(b), "start_seconds": 0, "end_seconds": 1},
+            ],
+        }
+    )
+    assert not result.success
+    assert "simulated primary trim failure" in (result.error or "")
+    assert "boom-rmdir-v3" not in (result.error or "")
+    assert result.data["temp_dir_exists_after"] is True
+    assert result.data["cleanup_ok"] is False
+    assert "OSError" in (result.data["cleanup_error"] or "")
+    assert "boom-rmdir-v3" in (result.data["cleanup_error"] or "")
+    assert a.is_file() and b.is_file()
+
+
+def test_concat_ownership_v3_primary_preserved_despite_cleanup_diags(
+    tmp_path: Path, monkeypatch
+):
+    """v3.11 (O3): primary trim error stays primary despite cleanup diags."""
+    from tools.base_tool import ToolResult
+
+    a = tmp_path / "a.mp4"
+    a.write_bytes(b"fake-a")
+    out = tmp_path / "out.mp4"
+
+    def fake_cut(self, inputs):
+        p = Path(inputs["output_path"])
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"leftover-artifact")
+        return ToolResult(
+            success=False,
+            error="simulated PRIMARY trim failure v3",
+            data={"operation": "cut"},
+        )
+
+    def boom_unlink(self, *args, **kwargs):
+        raise OSError("boom-unlink-primary-v3")
+
+    def boom_rmdir(self):
+        raise OSError("boom-rmdir-primary-v3")
+
+    monkeypatch.setattr(VideoTrimmer, "_cut", fake_cut)
+    monkeypatch.setattr(Path, "unlink", boom_unlink)
+    monkeypatch.setattr(Path, "rmdir", boom_rmdir)
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [{"input_path": str(a), "start_seconds": 0, "end_seconds": 1}],
+        }
+    )
+    assert not result.success
+    assert "simulated PRIMARY trim failure v3" in (result.error or "")
+    assert "boom-unlink-primary-v3" not in (result.error or "")
+    assert "boom-rmdir-primary-v3" not in (result.error or "")
+    assert "boom-unlink-primary-v3" in (result.data["cleanup_error"] or "")
+    assert "boom-rmdir-primary-v3" in (result.data["cleanup_error"] or "")
+    assert a.is_file()
+
+
+def test_concat_ownership_v3_partial_join_output_removed(tmp_path: Path, monkeypatch):
+    """v3.12 (O4): invocation-created partial join output is removed."""
+    from tools.base_tool import ToolResult
+
+    a = tmp_path / "a.mp4"
+    a.write_bytes(b"fake-a")
+    out = tmp_path / "out.mp4"
+
+    def ok_cut(self, inputs):
+        p = Path(inputs["output_path"])
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"good-temp")
+        return ToolResult(success=True, data={"operation": "cut"})
+
+    def join_writes_partial_then_raises(self, cmd: list[str], **kwargs):
+        Path(cmd[-1]).write_bytes(b"PARTIAL-JOIN-OUTPUT")
+        raise RuntimeError("simulated join failure after partial write")
+
+    monkeypatch.setattr(VideoTrimmer, "_cut", ok_cut)
+    monkeypatch.setattr(VideoTrimmer, "run_command", join_writes_partial_then_raises)
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [{"input_path": str(a)}],
+        }
+    )
+    assert not result.success
+    assert "concat join failed" in (result.error or "")
+    assert result.data["final_output_created"] is False
+    assert result.data["output_existed_before"] is False
+    assert result.data["output_created_by_invocation"] is True
+    assert result.data["partial_output_removed"] is True
+    assert result.data["partial_output_exists_after"] is False
+    assert not out.exists()
+    assert a.is_file()
+
+
+def test_concat_ownership_v3_partial_removal_failure_reported(
+    tmp_path: Path, monkeypatch
+):
+    """v3.13 (O4): unremovable partial join output is reported truthfully."""
+    from tools.base_tool import ToolResult
+
+    import tools.video.video_trimmer as vt_mod
+
+    a = tmp_path / "a.mp4"
+    a.write_bytes(b"fake-a")
+    out = tmp_path / "out.mp4"
+    real_remover = vt_mod._try_remove_artifact
+
+    def ok_cut(self, inputs):
+        p = Path(inputs["output_path"])
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"good-temp")
+        return ToolResult(success=True, data={"operation": "cut"})
+
+    def join_writes_partial_then_raises(self, cmd: list[str], **kwargs):
+        Path(cmd[-1]).write_bytes(b"PARTIAL-JOIN-OUTPUT")
+        raise RuntimeError("simulated join failure")
+
+    def selective_remover(p):
+        if Path(p) == out:
+            raise OSError("partial-blocked-v3")
+        return real_remover(p)
+
+    monkeypatch.setattr(VideoTrimmer, "_cut", ok_cut)
+    monkeypatch.setattr(VideoTrimmer, "run_command", join_writes_partial_then_raises)
+    monkeypatch.setattr(vt_mod, "_try_remove_artifact", selective_remover)
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [{"input_path": str(a)}],
+        }
+    )
+    assert not result.success
+    assert "concat join failed" in (result.error or "")
+    assert "partial-blocked-v3" not in (result.error or "")
+    assert result.data["final_output_created"] is False
+    assert result.data["output_created_by_invocation"] is True
+    assert result.data["partial_output_removed"] is False
+    assert result.data["partial_output_exists_after"] is True
+    assert "partial-blocked-v3" in (result.data["cleanup_error"] or "")
+    assert str(out) in result.data["cleanup_remaining_paths"]
+    assert result.data["cleanup_ok"] is False
+    assert out.is_file(), "unremovable partial must be reported, not hidden"
+    assert a.is_file()
+
+
+def test_concat_ownership_v3_preexisting_originals_never_owned(
+    tmp_path: Path, monkeypatch
+):
+    """v3.14 (O1): pre-existing originals are never cleanup-owned."""
+    from tools.base_tool import ToolResult
+    from tools.base_tool import ToolCommandError
+
+    tmpdir = tmp_path / ".concat_tmp"
+    tmpdir.mkdir(parents=True)
+    inner = tmpdir / "seg_0000.mp4"  # original living inside .concat_tmp
+    inner.write_bytes(b"INNER-ORIGINAL")
+    outer = tmp_path / "outer.mp4"
+    outer.write_bytes(b"OUTER-ORIGINAL")
+    out = tmp_path / "out.mp4"
+
+    def boom_join(self, cmd: list[str], **kwargs):
+        raise ToolCommandError(1, cmd, detail="simulated join failure")
+
+    monkeypatch.setattr(VideoTrimmer, "run_command", boom_join)
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [{"input_path": str(inner)}, {"input_path": str(outer)}],
+        }
+    )
+    assert not result.success
+    assert inner.is_file() and inner.read_bytes() == b"INNER-ORIGINAL"
+    assert outer.is_file() and outer.read_bytes() == b"OUTER-ORIGINAL"
+    owned = [d["path"] for d in result.data["temp_file_details"]]
+    assert str(inner) not in owned
+    assert str(outer) not in owned
+
+
+@needs_ffmpeg
+def test_concat_ownership_v3_normal_concat_unchanged(tmp_path: Path, dense_av: Path):
+    """v3.15: normal successful concat unchanged (real FFmpeg)."""
+    out = tmp_path / "v3_plain_join.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [{"input_path": str(dense_av)}, {"input_path": str(dense_av)}],
+        }
+    )
+    assert result.success, result.error
+    assert out.is_file()
+    assert "video" in _streams_of(out)
+    assert result.data["cleanup_attempted"] is True
+    assert result.data["cleanup_ok"] is True
+    assert not (out.parent / ".concat_tmp").exists()
+
+
+@needs_ffmpeg
+def test_concat_ownership_v3_aligned_trimmed_unchanged(
+    tmp_path: Path, dense_av: Path
+):
+    """v3.16: aligned trimmed concat unchanged (real FFmpeg)."""
+    out = tmp_path / "v3_aligned.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {
+                    "input_path": str(dense_av),
+                    "start_seconds": 0,
+                    "end_seconds": 3,
+                },
+                {"input_path": str(dense_av)},
+            ],
+        }
+    )
+    assert result.success, result.error
+    assert out.is_file()
+    assert "video" in _streams_of(out)
+    assert not (out.parent / ".concat_tmp").exists()
+
+
+@needs_ffmpeg
+def test_concat_ownership_v3_sparse_failure_unchanged(
+    tmp_path: Path, sparse_av: Path, dense_av: Path
+):
+    """v3.17: sparse/non-keyframe failure unchanged (real FFmpeg)."""
+    out = tmp_path / "v3_sparse.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {
+                    "input_path": str(sparse_av),
+                    "start_seconds": 1.7,
+                    "end_seconds": 4.3,
+                },
+                {"input_path": str(dense_av)},
+            ],
+        }
+    )
+    assert not result.success
+    err = (result.error or "").lower()
+    assert "re-encode" in err and "libx264" in err
+    assert result.data["failed_segment_index"] == 0
+    assert result.data["final_output_created"] is False
+    assert not out.exists()
+    assert not (out.parent / ".concat_tmp").exists()
+    assert sparse_av.is_file() and dense_av.is_file()
+
+
+@needs_ffmpeg
+def test_concat_ownership_v3_explicit_libx264_unchanged(
+    tmp_path: Path, sparse_av: Path, dense_av: Path
+):
+    """v3.18: explicit codec='libx264' behavior unchanged (real FFmpeg)."""
+    out = tmp_path / "v3_libx264.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "codec": "libx264",
+            "segments": [
+                {
+                    "input_path": str(sparse_av),
+                    "start_seconds": 1.7,
+                    "end_seconds": 4.3,
+                },
+                {
+                    "input_path": str(dense_av),
+                    "start_seconds": 0,
+                    "end_seconds": 2,
+                },
+            ],
+        }
+    )
+    assert result.success, result.error
+    assert out.is_file()
+    assert "video" in _streams_of(out)
+    assert not (out.parent / ".concat_tmp").exists()
+
+
+@needs_ffmpeg
+def test_concat_ownership_v3_cut_unchanged(tmp_path: Path, dense_av: Path, sparse_av: Path):
+    """v3.19: _cut() behavior unchanged by the ownership repair."""
+    ok_out = tmp_path / "v3_cut_ok.mp4"
+    ok_result = VideoTrimmer().execute(
+        {
+            "operation": "cut",
+            "input_path": str(dense_av),
+            "output_path": str(ok_out),
+            "start_seconds": 0,
+            "end_seconds": 3,
+            "codec": "copy",
+        }
+    )
+    assert ok_result.success, ok_result.error
+    assert "video" in _streams_of(ok_out)
+    assert ok_result.data["keyframe_aligned"] is True
+
+    bad_out = tmp_path / "v3_cut_bad.mp4"
+    bad_result = VideoTrimmer().execute(
+        {
+            "operation": "cut",
+            "input_path": str(sparse_av),
+            "output_path": str(bad_out),
+            "start_seconds": 1.7,
+            "end_seconds": 4.3,
+            "codec": "copy",
+        }
+    )
+    assert not bad_result.success
+    assert not bad_out.exists()
+    assert bad_result.data["keyframe_aligned"] is False
+
+
+@needs_ffmpeg
+def test_concat_ownership_v3_speed_unchanged(tmp_path: Path, dense_av: Path):
+    """v3.20: _speed() behavior unchanged by the ownership repair."""
+    out = tmp_path / "v3_fast.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "speed",
+            "input_path": str(dense_av),
+            "output_path": str(out),
+            "speed_factor": 2.0,
+        }
+    )
+    assert result.success, result.error
+    streams = _streams_of(out)
+    assert "video" in streams and "audio" in streams
+    assert result.data["speed_factor"] == 2.0

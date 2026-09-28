@@ -68,6 +68,62 @@ def probe_codec_types(path: Path) -> Optional[set[str]]:
     }
 
 
+# Copy-mode timing contract (B1 corrective repair).
+#
+# Stream-copy (`codec="copy"`) with input seeking (`-ss` before `-i`) starts
+# from the preceding keyframe, so the produced window can be materially
+# longer/shifted versus the requested [start, end) interval. The tool must
+# not silently report such a window as success.
+#
+# Contract: for codec="copy" with an explicit end_seconds, the ffprobe
+# format duration of the output must satisfy
+#   |actual_duration - requested_duration| <= COPY_DURATION_TOLERANCE_SEC
+# otherwise the cut fails closed with a re-encode recommendation. Re-encode
+# mode is frame-accurate and is not subject to this gate.
+#
+# Tolerance rationale: dense-GOP fixtures (keyframe every ~0.4s) show
+# packet-granularity jitter of ~0.17-0.27s on valid copy cuts, while the
+# failing sparse-GOP 1.7-4.3s case overshoots by ~1.87s (2.6s requested vs
+# ~4.47s actual). 0.5s accepts the former and rejects the latter with
+# margin on both sides.
+COPY_DURATION_TOLERANCE_SEC = 0.5
+
+
+def probe_output_duration(path: Path) -> Optional[float]:
+    """Return the ffprobe format duration in seconds, or None if unknown."""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                ffprobe,
+                "-v", "quiet",
+                "-print_format", "json",
+                "-show_format",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    fmt = data.get("format")
+    if not isinstance(fmt, dict):
+        return None
+    try:
+        return float(fmt.get("duration"))
+    except (TypeError, ValueError):
+        return None
+
+
 class VideoTrimmer(BaseTool):
     name = "video_trimmer"
     version = "0.1.0"
@@ -190,8 +246,20 @@ class VideoTrimmer(BaseTool):
 
         self.run_command(cmd)
 
-        # Post-cut validation: a video input must yield a video stream.
-        # Never report success for an audio-only cut of a video source.
+        # Post-cut validation (B1 fail-safe contract):
+        # - success=True must mean the output is PROVEN to contain video
+        #   whenever the trim is a video trim.
+        # - input probe None/empty is UNKNOWN, distinct from positively
+        #   identified audio-only. Never infer audio-only from unknown.
+        # - copy mode must satisfy the requested window within
+        #   COPY_DURATION_TOLERANCE_SEC or fail with a re-encode direction.
+        # Never use filename extensions as proof of stream type.
+        requested_duration: Optional[float] = None
+        if end_s is not None:
+            try:
+                requested_duration = float(end_s) - float(start_s)
+            except (TypeError, ValueError):
+                requested_duration = None
         base_data: dict[str, Any] = {
             "operation": "cut",
             "input": str(input_path),
@@ -199,6 +267,10 @@ class VideoTrimmer(BaseTool):
             "start_seconds": start_s,
             "end_seconds": end_s,
             "codec": codec,
+            "requested_duration": requested_duration,
+            "copy_duration_tolerance_sec": (
+                COPY_DURATION_TOLERANCE_SEC if codec == "copy" else None
+            ),
         }
         if not output_path.exists():
             return ToolResult(
@@ -213,37 +285,136 @@ class VideoTrimmer(BaseTool):
         output_types = probe_codec_types(output_path)
         base_data["input_streams"] = sorted(input_types) if input_types is not None else None
         base_data["output_streams"] = sorted(output_types) if output_types is not None else None
+        # Probe state classification: None or empty means UNKNOWN, never
+        # "known audio-only". Only a non-empty set without "video" is
+        # positively identified audio-only (or at least non-video).
+        input_unknown = input_types is None or len(input_types) == 0
+        input_known_video = (
+            not input_unknown and "video" in (input_types or set())
+        )
+        input_known_audio_only = (
+            not input_unknown and "video" not in (input_types or set())
+        )
+        base_data["input_probe"] = (
+            "known_video" if input_known_video
+            else "known_audio_only" if input_known_audio_only
+            else "unknown"
+        )
         if output_types is None:
-            # Probe inconclusive — do not claim a verified success, but
-            # leave the file in place for manual inspection.
+            # Output probe inconclusive — do not claim a verified success,
+            # but leave the file in place for manual inspection.
+            base_data["output_probe"] = "unknown"
             return ToolResult(
                 success=False,
                 error=(
                     "Cut output could not be stream-validated (ffprobe "
-                    f"unavailable or failed); not claiming success. Output "
+                    "output probe unknown/unavailable or failed); not "
+                    "claiming success. Output "
                     f"left at {output_path} for manual inspection."
                 ),
                 data=base_data,
             )
-        if "video" in (input_types or set()) and "video" not in output_types:
-            # Copy mode dropped the video stream (typically a non-keyframe
-            # cut). Never report success; remove the invalid artifact and
-            # point at re-encode mode. Do NOT silently fall back to a lossy
-            # re-encode of an explicitly requested codec="copy" operation.
-            try:
-                output_path.unlink()
-            except OSError:
-                pass
+        base_data["output_probe"] = "known"
+        if "video" not in output_types:
+            # Output is provably audio-only (or at least non-video).
+            if input_unknown:
+                # Fail closed: input might have been video; an audio-only
+                # result must never pass as a successful video trim. Do not
+                # infer the source was audio-only. Remove the artifact so a
+                # false success cannot be consumed downstream.
+                try:
+                    output_path.unlink()
+                except OSError:
+                    pass
+                return ToolResult(
+                    success=False,
+                    error=(
+                        "Cut produced audio-only output while the input "
+                        "stream probe is unknown/inconclusive "
+                        f"(input_streams={base_data['input_streams']}; "
+                        f"output_streams={sorted(output_types)}). Video "
+                        "preservation cannot be established, so success "
+                        "is denied (fail-closed). This unknown-probe state "
+                        "is distinct from positively identified audio-only "
+                        "input. The invalid output was removed; re-probe "
+                        "the input or retry with codec='libx264' "
+                        "(re-encode) once the source streams are known."
+                    ),
+                    data=base_data,
+                )
+            if input_known_video:
+                # Copy mode dropped the video stream (typically a non-keyframe
+                # cut). Never report success; remove the invalid artifact and
+                # point at re-encode mode. Do NOT silently fall back to a lossy
+                # re-encode of an explicitly requested codec="copy" operation.
+                try:
+                    output_path.unlink()
+                except OSError:
+                    pass
+                return ToolResult(
+                    success=False,
+                    error=(
+                        "copy-mode cut produced no video stream (input has "
+                        f"video; output streams: {sorted(output_types)}). "
+                        "Stream-copy cannot cut accurately at this position; "
+                        "retry with codec='libx264' (re-encode) instead of "
+                        "codec='copy'. The invalid output was removed."
+                    ),
+                    data=base_data,
+                )
+            # Positively identified audio-only input -> audio-only output is
+            # the supported path.
+            base_data["output_has_video"] = False
             return ToolResult(
-                success=False,
-                error=(
-                    "copy-mode cut produced no video stream (input has "
-                    f"video; output streams: {sorted(output_types)}). "
-                    "Stream-copy cannot cut accurately at this position; "
-                    "retry with codec='libx264' (re-encode) instead of "
-                    "codec='copy'. The invalid output was removed."
-                ),
+                success=True,
                 data=base_data,
+                artifacts=[str(output_path)],
+            )
+        # Output provably contains video. For copy mode with an explicit
+        # window, additionally enforce the timing contract.
+        if codec == "copy" and requested_duration is not None:
+            actual_duration = probe_output_duration(output_path)
+            base_data["actual_duration"] = actual_duration
+            if actual_duration is None:
+                # Cannot validate the cut window — fail closed, leave the
+                # file for manual inspection (timing unproven, streams OK).
+                return ToolResult(
+                    success=False,
+                    error=(
+                        "copy-mode cut output has video but its duration "
+                        "could not be validated (ffprobe duration probe "
+                        "unknown/failed); not claiming the requested "
+                        f"[{start_s}, {end_s}] window. Output left at "
+                        f"{output_path} for manual inspection."
+                    ),
+                    data=base_data,
+                )
+            delta = abs(actual_duration - requested_duration)
+            base_data["duration_delta"] = delta
+            if delta > COPY_DURATION_TOLERANCE_SEC:
+                try:
+                    output_path.unlink()
+                except OSError:
+                    pass
+                return ToolResult(
+                    success=False,
+                    error=(
+                        "copy-mode cut cannot satisfy the requested "
+                        f"[{start_s}, {end_s}] window within tolerance "
+                        f"(requested {requested_duration:.3f}s, actual "
+                        f"{actual_duration:.3f}s, delta {delta:.3f}s > "
+                        f"tolerance {COPY_DURATION_TOLERANCE_SEC:.3f}s). "
+                        "Stream-copy starts from the preceding keyframe and "
+                        "is not frame-accurate; retry with codec='libx264' "
+                        "(re-encode) instead of codec='copy'. The invalid "
+                        "output was removed."
+                    ),
+                    data=base_data,
+                )
+        else:
+            base_data["actual_duration"] = (
+                probe_output_duration(output_path)
+                if "video" in output_types else None
             )
 
         base_data["output_has_video"] = "video" in output_types

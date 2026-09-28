@@ -8,6 +8,7 @@ preview/review outputs.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import shutil
 import subprocess
@@ -65,6 +66,140 @@ def _normalize_style(style: Any) -> dict[str, Any]:
         if style.get(key):
             normalized[key] = str(style[key])
     return normalized
+
+
+# Conditional video-preview requirements for CharacterRigRenderer.
+# The default/package-only path (HTML preview + HyperFrames workspace) needs
+# none of these. They apply ONLY when render_video=True or video_output_path
+# is set. They must stay out of global `dependencies` so the tool remains
+# AVAILABLE for package-only work.
+_RENDER_VIDEO_CONDITIONAL_DEPENDENCIES = [
+    "python:playwright",
+    "playwright:chromium",
+    "cmd:ffmpeg",
+]
+
+_RENDER_VIDEO_INSTALL_GUIDANCE = (
+    "To enable character_rig_renderer render_video: "
+    "1) install the Python Playwright package in the active environment "
+    "(pip install playwright); "
+    "2) install the Playwright Chromium browser "
+    "(python -m playwright install chromium); "
+    "3) ensure FFmpeg is installed and on PATH "
+    "(https://ffmpeg.org/download.html). "
+    "No installation is performed automatically."
+)
+
+
+def _is_python_playwright_available() -> bool:
+    """Return True when `playwright.sync_api` can be imported."""
+    try:
+        import importlib.util
+
+        return importlib.util.find_spec("playwright.sync_api") is not None
+    except Exception:
+        return False
+
+
+def _is_ffmpeg_available() -> bool:
+    """Return True when an `ffmpeg` binary is on PATH."""
+    return shutil.which("ffmpeg") is not None
+
+
+def _probe_chromium_launchable() -> tuple[bool, str]:
+    """Probe actual Playwright Chromium launchability without network/installs.
+
+    Returns (launchable, detail). Always closes any browser it launches,
+    including on failure paths.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        return False, f"Python Playwright module unavailable: {exc}"
+    browser = None
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            try:
+                return True, "Playwright Chromium launched successfully"
+            finally:
+                with contextlib.suppress(Exception):
+                    browser.close()
+                browser = None
+    except Exception as exc:
+        with contextlib.suppress(Exception):
+            if browser is not None:
+                browser.close()
+        return False, f"Playwright Chromium not launchable: {exc}"
+    finally:
+        with contextlib.suppress(Exception):
+            if browser is not None:
+                browser.close()
+
+
+def check_render_video_readiness() -> dict[str, Any]:
+    """Narrow preflight for the optional render_video path.
+
+    Distinguishes python:playwright vs playwright:chromium vs cmd:ffmpeg.
+    Performs no installs and no network access. Safe to call repeatedly.
+    """
+    missing: list[str] = []
+    details: dict[str, str] = {}
+    if _is_python_playwright_available():
+        details["python_playwright"] = "available"
+    else:
+        missing.append("python:playwright")
+        details["python_playwright"] = "unavailable"
+    if _is_ffmpeg_available():
+        details["ffmpeg"] = "available"
+    else:
+        missing.append("cmd:ffmpeg")
+        details["ffmpeg"] = "unavailable"
+    if "python:playwright" in missing:
+        details["chromium"] = "unknown (Python Playwright missing; launch not probed)"
+    else:
+        launchable, detail = _probe_chromium_launchable()
+        if launchable:
+            details["chromium"] = f"launchable ({detail})"
+        else:
+            missing.append("playwright:chromium")
+            details["chromium"] = detail
+    return {
+        "ready": not missing,
+        "missing": missing,
+        "details": details,
+        "conditional_dependencies": list(_RENDER_VIDEO_CONDITIONAL_DEPENDENCIES),
+        "install_guidance": _RENDER_VIDEO_INSTALL_GUIDANCE,
+    }
+
+
+def _render_video_unavailable_result(
+    readiness: dict[str, Any],
+    *,
+    duration_seconds: float = 0.0,
+) -> ToolResult:
+    """Build a clean structured failure for an unready render_video request."""
+    missing = list(readiness.get("missing", []))
+    details = dict(readiness.get("details", {}))
+    guidance = str(readiness.get("install_guidance", _RENDER_VIDEO_INSTALL_GUIDANCE))
+    error = (
+        "render_video requested but the optional video-preview runtime is not ready. "
+        f"Missing: {', '.join(missing) if missing else 'unknown'}. "
+        f"Details: {details}. {guidance} No video was rendered."
+    )
+    return ToolResult(
+        success=False,
+        data={
+            "requested_operation": "render_video",
+            "missing_dependencies": missing,
+            "readiness": {"ready": False, "missing": missing, "details": details},
+            "conditional_dependencies": list(_RENDER_VIDEO_CONDITIONAL_DEPENDENCIES),
+            "install_guidance": guidance,
+        },
+        artifacts=[],
+        error=error,
+        duration_seconds=round(duration_seconds, 2),
+    )
 
 
 def _render_preview_mp4(preview_path: Path, video_path: Path, duration_seconds: float, fps: int) -> None:
@@ -483,6 +618,18 @@ class CharacterRigRenderer(BaseTool):
         "hyperframes",
     ]
     capabilities = ["write_browser_preview", "prepare_character_render_package"]
+    supports = {
+        "render_package": {
+            "available_without_browser": True,
+        },
+        "render_video": {
+            "conditional_dependencies": [
+                "python:playwright",
+                "playwright:chromium",
+                "cmd:ffmpeg",
+            ],
+        },
+    }
     input_schema = {
         "type": "object",
         "required": ["action_timeline"],
@@ -516,8 +663,20 @@ class CharacterRigRenderer(BaseTool):
     ]
     user_visible_verification = ["Open preview and check character visibility and motion"]
 
+    def check_video_readiness(self) -> dict[str, Any]:
+        """Return the narrow readiness envelope for the optional render_video path."""
+        return check_render_video_readiness()
+
     def execute(self, inputs: dict[str, Any]) -> ToolResult:
         start = time.time()
+        if bool(inputs.get("render_video") or inputs.get("video_output_path")):
+            readiness = self.check_video_readiness()
+            if not readiness.get("ready"):
+                failure = _render_video_unavailable_result(
+                    readiness,
+                    duration_seconds=time.time() - start,
+                )
+                return failure
         output_path = Path(inputs.get("output_path", "projects/character-preview/preview.html"))
         output_path.parent.mkdir(parents=True, exist_ok=True)
         timeline_json = json.dumps(inputs["action_timeline"])
@@ -732,7 +891,56 @@ class CharacterRigRenderer(BaseTool):
             video_path.parent.mkdir(parents=True, exist_ok=True)
             duration_seconds = float(inputs.get("duration_seconds", 3))
             fps = int(inputs.get("fps", 12))
-            _render_preview_mp4(output_path, video_path, duration_seconds, fps)
+            video_existed_before = video_path.exists()
+            try:
+                _render_preview_mp4(output_path, video_path, duration_seconds, fps)
+            except Exception as exc:
+                with contextlib.suppress(Exception):
+                    if video_path.exists() and not video_existed_before:
+                        video_path.unlink()
+                readiness = self.check_video_readiness()
+                missing = list(readiness.get("missing", []))
+                details = dict(readiness.get("details", {}))
+                guidance = str(
+                    readiness.get("install_guidance", _RENDER_VIDEO_INSTALL_GUIDANCE)
+                )
+                error = (
+                    "render_video requested but the optional video-preview runtime "
+                    f"failed: {exc}. Missing/unready: "
+                    f"{', '.join(missing) if missing else 'none reported by preflight; see render error'}. "
+                    f"Details: {details}. {guidance} "
+                    "The package outputs above were still written, but no video was rendered."
+                )
+                return ToolResult(
+                    success=False,
+                    data={
+                        "requested_operation": "render_video",
+                        "missing_dependencies": missing,
+                        "readiness": {
+                            "ready": False,
+                            "missing": missing,
+                            "details": details,
+                        },
+                        "conditional_dependencies": list(
+                            _RENDER_VIDEO_CONDITIONAL_DEPENDENCIES
+                        ),
+                        "install_guidance": guidance,
+                        "render_error": str(exc),
+                        "preview_path": str(output_path),
+                        "render_package": "hyperframes_workspace",
+                        "hyperframes_workspace": str(workspace_path),
+                        "composition_path": str(composition_path),
+                        "asset_manifest": asset_manifest,
+                        "edit_decisions": edit_decisions,
+                    },
+                    artifacts=[
+                        str(output_path),
+                        str(workspace_path / "hyperframes.json"),
+                        str(composition_path),
+                    ],
+                    error=error,
+                    duration_seconds=round(time.time() - start, 2),
+                )
             video_asset_id = f"{output_path.stem}_preview_video"
             video_asset_manifest = {
                 "version": "1.0",

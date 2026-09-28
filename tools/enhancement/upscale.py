@@ -114,10 +114,36 @@ class Upscale(BaseTool):
 
     def get_status(self) -> ToolStatus:
         try:
-            import realesrgan  # noqa: F401
+            from tools.enhancement._torchvision_compat import (
+                ensure_torchvision_compat,
+            )
+
+            ensure_torchvision_compat()
+            import torch  # noqa: F401
+            from basicsr.archs.rrdbnet_arch import RRDBNet  # noqa: F401
+            from realesrgan import RealESRGANer  # noqa: F401
             return ToolStatus.AVAILABLE
-        except ImportError:
+        except (ImportError, ModuleNotFoundError):
             return ToolStatus.UNAVAILABLE
+        except Exception:
+            return ToolStatus.UNAVAILABLE
+
+    def _preflight(self) -> str | None:
+        """Check the real execution imports. Return error string or None."""
+        try:
+            from tools.enhancement._torchvision_compat import (
+                ensure_torchvision_compat,
+            )
+
+            ensure_torchvision_compat()
+            import torch  # noqa: F401
+            from basicsr.archs.rrdbnet_arch import RRDBNet  # noqa: F401
+            from realesrgan import RealESRGANer  # noqa: F401
+        except ImportError as e:
+            return f"Missing dependency: {e}. Run: uv pip install realesrgan torch"
+        except Exception as e:
+            return f"Dependency check failed: {e}"
+        return None
 
     # ------------------------------------------------------------------
     # Execution
@@ -129,6 +155,17 @@ class Upscale(BaseTool):
             return ToolResult(success=False, error=f"Input not found: {input_path}")
 
         is_video = input_path.suffix.lower() in VIDEO_EXTENSIONS
+
+        # Dependency preflight BEFORE creating any output directories/files.
+        preflight_error = self._preflight()
+        if preflight_error is not None:
+            return ToolResult(success=False, error=preflight_error)
+
+        if is_video and shutil.which("ffmpeg") is None:
+            return ToolResult(
+                success=False,
+                error="Missing dependency: ffmpeg not found. Install ffmpeg to upscale video.",
+            )
 
         default_output = str(input_path.with_stem(f"{input_path.stem}_upscaled"))
         output_path = Path(inputs.get("output_path", default_output))
@@ -271,6 +308,12 @@ class Upscale(BaseTool):
     ):
         """Build and return a RealESRGANer instance."""
         import inspect
+
+        from tools.enhancement._torchvision_compat import (
+            ensure_torchvision_compat,
+        )
+
+        ensure_torchvision_compat()
 
         import torch
         from basicsr.archs.rrdbnet_arch import RRDBNet

@@ -100,10 +100,53 @@ class FaceRestore(BaseTool):
 
     def get_status(self) -> ToolStatus:
         try:
-            import gfpgan  # noqa: F401
+            from tools.enhancement._torchvision_compat import (
+                ensure_torchvision_compat,
+            )
+
+            ensure_torchvision_compat()
+            import torch  # noqa: F401
+            from gfpgan import GFPGANer  # noqa: F401
             return ToolStatus.AVAILABLE
-        except ImportError:
+        except (ImportError, ModuleNotFoundError):
             return ToolStatus.UNAVAILABLE
+        except Exception:
+            return ToolStatus.UNAVAILABLE
+
+    def _preflight(self) -> str | None:
+        """Check the real execution imports (bg_upsampler excluded)."""
+        try:
+            from tools.enhancement._torchvision_compat import (
+                ensure_torchvision_compat,
+            )
+
+            ensure_torchvision_compat()
+            import torch  # noqa: F401
+            from gfpgan import GFPGANer  # noqa: F401
+        except ImportError as e:
+            return f"Missing dependency: {e}. Run: uv pip install gfpgan"
+        except Exception as e:
+            return f"Dependency check failed: {e}"
+        return None
+
+    def _preflight_bg_upsampler(self) -> str | None:
+        """Check the conditional Real-ESRGAN background path."""
+        try:
+            from tools.enhancement._torchvision_compat import (
+                ensure_torchvision_compat,
+            )
+
+            ensure_torchvision_compat()
+            from basicsr.archs.rrdbnet_arch import RRDBNet  # noqa: F401
+            from realesrgan import RealESRGANer  # noqa: F401
+        except ImportError as e:
+            return (
+                f"bg_upsampler requested but Real-ESRGAN unavailable: {e}. "
+                "Run: uv pip install realesrgan"
+            )
+        except Exception as e:
+            return f"bg_upsampler dependency check failed: {e}"
+        return None
 
     def execute(self, inputs: dict[str, Any]) -> ToolResult:
         input_path = Path(inputs["input_path"])
@@ -122,6 +165,11 @@ class FaceRestore(BaseTool):
         bg_upsampler_flag = inputs.get("bg_upsampler", False)
 
         try:
+            from tools.enhancement._torchvision_compat import (
+                ensure_torchvision_compat,
+            )
+
+            ensure_torchvision_compat()
             import cv2
             import inspect
             from gfpgan import GFPGANer
@@ -132,14 +180,22 @@ class FaceRestore(BaseTool):
                 success=False,
                 error=f"Missing dependency: {e}. Run: uv pip install gfpgan",
             )
+        except Exception as e:
+            return ToolResult(
+                success=False,
+                error=f"Dependency check failed: {e}",
+            )
 
         _device = _get_device()
 
         start = time.time()
 
-        # Optional background upsampler
+        # Optional background upsampler (conditional: only required when asked).
         bg_upsampler = None
         if bg_upsampler_flag:
+            bg_error = self._preflight_bg_upsampler()
+            if bg_error is not None:
+                return ToolResult(success=False, error=bg_error)
             try:
                 from basicsr.archs.rrdbnet_arch import RRDBNet
                 from realesrgan import RealESRGANer
@@ -164,8 +220,19 @@ class FaceRestore(BaseTool):
                 if "device" in inspect.signature(RealESRGANer.__init__).parameters:
                     bg_kwargs["device"] = torch.device(_device)
                 bg_upsampler = RealESRGANer(**bg_kwargs)
-            except ImportError:
-                bg_upsampler = None
+            except ImportError as e:
+                return ToolResult(
+                    success=False,
+                    error=(
+                        "bg_upsampler requested but Real-ESRGAN unavailable: "
+                        f"{e}. Run: uv pip install realesrgan"
+                    ),
+                )
+            except Exception as e:
+                return ToolResult(
+                    success=False,
+                    error=f"Failed to build bg_upsampler: {e}",
+                )
 
         # Select model path based on model choice
         if model_name == "CodeFormer":
@@ -239,6 +306,7 @@ class FaceRestore(BaseTool):
                 "upscale": upscale,
                 "fidelity": fidelity if model_name == "CodeFormer" else None,
                 "bg_upsampler": bg_upsampler_flag,
+                "bg_upsampler_applied": bool(bg_upsampler_flag),
             },
             artifacts=[str(output_path)],
             duration_seconds=round(elapsed, 2),

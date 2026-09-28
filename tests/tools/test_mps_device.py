@@ -234,6 +234,10 @@ def test_upscale_build_upsampler_uses_signature_guard(monkeypatch):
     monkeypatch.setitem(sys.modules, "tools.video._shared", fake_shared)
     fake_shared.get_torch_device.return_value = "mps"
 
+    compat_mock = MagicMock()
+    compat_mock.ensure_torchvision_compat.return_value = False
+    monkeypatch.setitem(sys.modules, "tools.enhancement._torchvision_compat", compat_mock)
+
     from tools.enhancement import upscale
     importlib.reload(upscale)
 
@@ -274,6 +278,10 @@ def test_upscale_build_upsampler_skips_device_when_unsupported(monkeypatch):
     fake_shared = MagicMock()
     monkeypatch.setitem(sys.modules, "tools.video._shared", fake_shared)
     fake_shared.get_torch_device.return_value = "mps"
+
+    compat_mock = MagicMock()
+    compat_mock.ensure_torchvision_compat.return_value = False
+    monkeypatch.setitem(sys.modules, "tools.enhancement._torchvision_compat", compat_mock)
 
     from tools.enhancement import upscale
     importlib.reload(upscale)
@@ -328,6 +336,10 @@ def test_face_restore_uses_signature_guard(monkeypatch):
     fake_shared = MagicMock()
     fake_shared.get_torch_device.return_value = "mps"
     monkeypatch.setitem(sys.modules, "tools.video._shared", fake_shared)
+
+    compat_mock = MagicMock()
+    compat_mock.ensure_torchvision_compat.return_value = False
+    monkeypatch.setitem(sys.modules, "tools.enhancement._torchvision_compat", compat_mock)
 
     from tools.enhancement import face_restore
     importlib.reload(face_restore)

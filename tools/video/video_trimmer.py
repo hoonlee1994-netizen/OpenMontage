@@ -922,46 +922,213 @@ class VideoTrimmer(BaseTool):
         def _cleanup_temps() -> dict[str, Any]:
             """Remove temp files created during this concat attempt.
 
-            Never touches original inputs. Reports truthfully: per-file
-            removal outcome plus whether the temp dir still exists.
+            Best-effort and non-throwing: never raises to the main control
+            flow, so a cleanup failure can never mask the primary trim/join
+            error. Never touches original inputs. Reports truthfully:
+            per-file removal outcome, which paths remain, and any helper
+            error separately from the primary failure.
             """
-            file_details: list[dict[str, Any]] = []
-            for tf in temp_files:
-                if tf.parent != temp_dir:
-                    continue  # never delete original inputs
-                removed, exists_after = _try_remove_artifact(tf)
-                file_details.append(
-                    {
-                        "path": str(tf),
-                        "removed": removed,
-                        "exists_after": exists_after,
-                    }
-                )
-            list_removed: Optional[bool] = None
-            if list_path.exists():
-                list_removed, list_exists_after = _try_remove_artifact(list_path)
-            else:
+            try:
+                file_details: list[dict[str, Any]] = []
+                cleanup_error: Optional[str] = None
+                try:
+                    snapshot = list(temp_files)
+                except Exception as e:
+                    snapshot = []
+                    cleanup_error = f"{type(e).__name__}: {e}"
+                for tf in snapshot:
+                    try:
+                        try:
+                            inside = (tf.parent == temp_dir)
+                        except Exception:
+                            continue  # cannot prove ownership; never delete
+                        if not inside:
+                            continue  # never delete original inputs
+                        try:
+                            removed, exists_after = _try_remove_artifact(tf)
+                        except Exception as e:
+                            try:
+                                file_details.append(
+                                    {
+                                        "path": str(tf),
+                                        "removed": False,
+                                        "exists_after": True,
+                                        "cleanup_error": f"{type(e).__name__}: {e}",
+                                    }
+                                )
+                            except Exception:
+                                pass
+                            continue
+                        try:
+                            file_details.append(
+                                {
+                                    "path": str(tf),
+                                    "removed": bool(removed),
+                                    "exists_after": bool(exists_after),
+                                }
+                            )
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        try:
+                            file_details.append(
+                                {
+                                    "path": str(tf),
+                                    "removed": False,
+                                    "exists_after": True,
+                                    "cleanup_error": f"{type(e).__name__}: {e}",
+                                }
+                            )
+                        except Exception:
+                            pass
+                list_removed: Optional[bool] = None
                 list_exists_after = False
+                try:
+                    try:
+                        list_exists = list_path.exists()
+                    except Exception as e:
+                        cleanup_error = (
+                            (cleanup_error + "; " if cleanup_error else "")
+                            + f"concat_list stat failed: {type(e).__name__}: {e}"
+                        )
+                        list_exists = False
+                        try:
+                            list_removed, list_exists_after = _try_remove_artifact(
+                                list_path
+                            )
+                        except Exception as e2:
+                            list_removed, list_exists_after = False, True
+                            cleanup_error += (
+                                f"; concat_list removal failed: "
+                                f"{type(e2).__name__}: {e2}"
+                            )
+                    else:
+                        if list_exists:
+                            try:
+                                list_removed, list_exists_after = _try_remove_artifact(
+                                    list_path
+                                )
+                            except Exception as e:
+                                list_removed, list_exists_after = False, True
+                                cleanup_error = (
+                                    (cleanup_error + "; " if cleanup_error else "")
+                                    + f"concat_list removal failed: "
+                                    f"{type(e).__name__}: {e}"
+                                )
+                        else:
+                            list_exists_after = False
+                except Exception as e:
+                    cleanup_error = (
+                        (cleanup_error + "; " if cleanup_error else "")
+                        + f"concat_list cleanup failed: {type(e).__name__}: {e}"
+                    )
+                    list_removed = None
+                    list_exists_after = True
+                try:
+                    try:
+                        temp_dir.rmdir()
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        pass
+                    except Exception as e:
+                        cleanup_error = (
+                            (cleanup_error + "; " if cleanup_error else "")
+                            + f"temp_dir removal failed: {type(e).__name__}: {e}"
+                        )
+                except Exception as e:
+                    cleanup_error = (
+                        (cleanup_error + "; " if cleanup_error else "")
+                        + f"temp_dir removal failed: {type(e).__name__}: {e}"
+                    )
+                try:
+                    temp_dir_exists_after = temp_dir.exists()
+                except Exception:
+                    temp_dir_exists_after = True
+                try:
+                    remaining: list[str] = [
+                        d["path"]
+                        for d in file_details
+                        if isinstance(d, dict) and d.get("exists_after")
+                    ]
+                    if list_exists_after:
+                        try:
+                            remaining.append(str(list_path))
+                        except Exception:
+                            pass
+                    if temp_dir_exists_after:
+                        try:
+                            remaining.append(str(temp_dir))
+                        except Exception:
+                            pass
+                except Exception:
+                    remaining = []
+                try:
+                    cleanup_ok = (len(remaining) == 0) and (cleanup_error is None)
+                except Exception:
+                    cleanup_ok = False
+                return {
+                    "cleanup_attempted": True,
+                    "temp_file_details": file_details,
+                    "concat_list_removed": list_removed,
+                    "concat_list_exists_after": list_exists_after,
+                    "temp_dir_exists_after": temp_dir_exists_after,
+                    "cleanup_error": cleanup_error,
+                    "cleanup_remaining_paths": remaining,
+                    "cleanup_ok": cleanup_ok,
+                }
+            except Exception as e:
+                try:
+                    td_exists = temp_dir.exists()
+                except Exception:
+                    td_exists = True
+                try:
+                    td_str = str(temp_dir)
+                except Exception:
+                    td_str = ".concat_tmp"
+                return {
+                    "cleanup_attempted": True,
+                    "temp_file_details": [],
+                    "concat_list_removed": None,
+                    "concat_list_exists_after": True,
+                    "temp_dir_exists_after": td_exists,
+                    "cleanup_error": (
+                        f"cleanup helper failed: {type(e).__name__}: {e}"
+                    ),
+                    "cleanup_remaining_paths": [td_str],
+                    "cleanup_ok": False,
+                }
+
+        def _safe_cleanup() -> dict[str, Any]:
+            """Invoke _cleanup_temps without ever raising (defense in depth)."""
             try:
-                temp_dir.rmdir()
-            except OSError:
-                pass
-            try:
-                temp_dir_exists_after = temp_dir.exists()
-            except OSError:
-                temp_dir_exists_after = True
-            return {
-                "cleanup_attempted": True,
-                "temp_file_details": file_details,
-                "concat_list_removed": list_removed,
-                "concat_list_exists_after": list_exists_after,
-                "temp_dir_exists_after": temp_dir_exists_after,
-            }
+                return _cleanup_temps()
+            except Exception as e:
+                try:
+                    td_exists = temp_dir.exists()
+                except Exception:
+                    td_exists = True
+                try:
+                    td_str = str(temp_dir)
+                except Exception:
+                    td_str = ".concat_tmp"
+                return {
+                    "cleanup_attempted": True,
+                    "temp_file_details": [],
+                    "concat_list_removed": None,
+                    "concat_list_exists_after": True,
+                    "temp_dir_exists_after": td_exists,
+                    "cleanup_error": (
+                        f"cleanup helper raised: {type(e).__name__}: {e}"
+                    ),
+                    "cleanup_remaining_paths": [td_str],
+                    "cleanup_ok": False,
+                }
 
         for i, seg in enumerate(segments):
             seg_input = Path(seg["input_path"])
             if not seg_input.exists():
-                cleanup = _cleanup_temps()
+                cleanup = _safe_cleanup()
                 return ToolResult(
                     success=False,
                     error=(
@@ -991,17 +1158,53 @@ class VideoTrimmer(BaseTool):
                 # stream-copy path is maintained here; a failed trim must
                 # never enter the concat list.
                 temp_path = temp_dir / f"seg_{i:04d}{seg_input.suffix}"
-                trim_result = self._cut(
-                    {
-                        "input_path": str(seg_input),
-                        "output_path": str(temp_path),
-                        "start_seconds": seg_start if seg_start is not None else 0,
-                        "end_seconds": seg_end,
-                        "codec": codec,
-                    }
-                )
+                # Cleanup authority (D1): register before invoking _cut so a
+                # failed trim that intentionally leaves its artifact for
+                # inspection is still cleanup-owned.
+                if temp_path not in temp_files:
+                    temp_files.append(temp_path)
+                try:
+                    trim_result = self._cut(
+                        {
+                            "input_path": str(seg_input),
+                            "output_path": str(temp_path),
+                            "start_seconds": seg_start if seg_start is not None else 0,
+                            "end_seconds": seg_end,
+                            "codec": codec,
+                        }
+                    )
+                except Exception as e:
+                    # Narrow segment-exception semantics (D2): preserve the
+                    # segment index and the original exception context, halt
+                    # without running later segments or the final join.
+                    cleanup = _safe_cleanup()
+                    exc_text = f"{type(e).__name__}: {e}"
+                    return ToolResult(
+                        success=False,
+                        error=(
+                            f"concat segment {i} trim raised {exc_text}; "
+                            f"concat aborted before final join "
+                            f"({len(segments)} segments requested). "
+                            "No final artifact was created."
+                        ),
+                        data={
+                            "operation": "concat",
+                            "segment_count": len(segments),
+                            "failed_segment_index": i,
+                            "segment_input": str(seg_input),
+                            "segment_start_seconds": seg_start,
+                            "segment_end_seconds": seg_end,
+                            "codec": codec,
+                            "trim_exception_type": type(e).__name__,
+                            "trim_exception": str(e),
+                            "trim_error": exc_text,
+                            "trim_data": None,
+                            "final_output_created": False,
+                            **cleanup,
+                        },
+                    )
                 if not trim_result.success:
-                    cleanup = _cleanup_temps()
+                    cleanup = _safe_cleanup()
                     return ToolResult(
                         success=False,
                         error=(
@@ -1024,10 +1227,14 @@ class VideoTrimmer(BaseTool):
                             **cleanup,
                         },
                     )
-                if not temp_path.exists():
+                try:
+                    trim_output_exists = temp_path.exists()
+                except Exception:
+                    trim_output_exists = False
+                if not trim_output_exists:
                     # Defensive: _cut claimed success but left no file; do
                     # not let a missing entry reach the concat list.
-                    cleanup = _cleanup_temps()
+                    cleanup = _safe_cleanup()
                     return ToolResult(
                         success=False,
                         error=(
@@ -1051,17 +1258,38 @@ class VideoTrimmer(BaseTool):
                             **cleanup,
                         },
                     )
-                temp_files.append(temp_path)
                 concat_inputs.append(temp_path)
             else:
                 concat_inputs.append(seg_input)
 
-        # Write concat file list
-        with open(list_path, "w", encoding="utf-8") as f:
-            for tf in concat_inputs:
-                # FFmpeg concat demuxer needs forward slashes and escaped quotes
-                safe_path = str(tf.resolve()).replace("\\", "/")
-                f.write(f"file '{safe_path}'\n")
+        # Write concat file list (temp-owned; failure still cleans temps and
+        # preserves the primary list-write error).
+        try:
+            with open(list_path, "w", encoding="utf-8") as f:
+                for tf in concat_inputs:
+                    # FFmpeg concat demuxer needs forward slashes and escaped quotes
+                    safe_path = str(tf.resolve()).replace("\\", "/")
+                    f.write(f"file '{safe_path}'\n")
+        except Exception as e:
+            cleanup = _safe_cleanup()
+            exc_text = f"{type(e).__name__}: {e}"
+            return ToolResult(
+                success=False,
+                error=(
+                    f"concat list write failed: {exc_text}; concat aborted "
+                    f"before final join ({len(segments)} segments requested). "
+                    "No final artifact was created."
+                ),
+                data={
+                    "operation": "concat",
+                    "segment_count": len(segments),
+                    "output": str(output_path),
+                    "join_error": exc_text,
+                    "join_exception_type": type(e).__name__,
+                    "final_output_created": False,
+                    **cleanup,
+                },
+            )
 
         cmd = [
             "ffmpeg", "-y",
@@ -1073,7 +1301,8 @@ class VideoTrimmer(BaseTool):
         try:
             self.run_command(cmd)
         except Exception as e:
-            cleanup = _cleanup_temps()
+            cleanup = _safe_cleanup()
+            exc_text = f"{type(e).__name__}: {e}"
             return ToolResult(
                 success=False,
                 error=f"concat join failed: {e}",
@@ -1081,12 +1310,15 @@ class VideoTrimmer(BaseTool):
                     "operation": "concat",
                     "segment_count": len(segments),
                     "output": str(output_path),
+                    "join_error": str(e),
+                    "join_exception_type": type(e).__name__,
+                    "join_exception": exc_text,
                     "final_output_created": False,
                     **cleanup,
                 },
             )
 
-        cleanup = _cleanup_temps()
+        cleanup = _safe_cleanup()
         return ToolResult(
             success=True,
             data={

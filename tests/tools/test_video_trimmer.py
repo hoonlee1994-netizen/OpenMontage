@@ -1547,3 +1547,710 @@ def test_speed_behavior_unchanged_by_concat_repair(
     streams = _streams_of(out)
     assert "video" in streams and "audio" in streams
     assert result.data["speed_factor"] == 2.0
+
+
+# ------------------------------------------------------------------
+# Concat cleanup corrective repair v2: failure-safe cleanup ownership,
+# narrow segment-exception semantics, non-masking cleanup.
+#
+# Every temp path is cleanup-owned before _cut; _cut exceptions preserve
+# the segment index; cleanup can never mask the primary trim/join error.
+# ------------------------------------------------------------------
+
+
+def test_concat_cleanup_v2_failed_trim_artifact_removed(tmp_path: Path):
+    """v2.1: failed _cut that leaves an artifact is still cleaned."""
+    from tools.base_tool import ToolResult
+
+    a = tmp_path / "a.mp4"
+    a.write_bytes(b"fake-a")
+    out = tmp_path / "out.mp4"
+    tmpdir = out.parent / ".concat_tmp"
+
+    def fake_cut(self, inputs):
+        p = Path(inputs["output_path"])
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"leftover-for-inspection")
+        return ToolResult(
+            success=False,
+            error="Cut output could not be stream-validated (simulated); left for inspection.",
+            data={"operation": "cut", "output_probe": "unknown"},
+        )
+
+    import unittest.mock as mock
+
+    with mock.patch.object(VideoTrimmer, "_cut", fake_cut):
+        result = VideoTrimmer().execute(
+            {
+                "operation": "concat",
+                "output_path": str(out),
+                "segments": [
+                    {"input_path": str(a), "start_seconds": 0, "end_seconds": 2}
+                ],
+            }
+        )
+    assert not result.success
+    assert result.data["failed_segment_index"] == 0
+    assert "simulated" in (result.data["trim_error"] or "")
+    assert list(tmp_path.rglob("seg_*.mp4")) == []
+    assert not tmpdir.exists()
+    assert result.data["temp_dir_exists_after"] is False
+    assert a.is_file(), "original inputs must never be deleted"
+
+
+def test_concat_cleanup_v2_failed_trim_no_artifact_harmless(tmp_path: Path):
+    """v2.2: failed _cut with no artifact leaves cleanup harmless."""
+    from tools.base_tool import ToolResult
+
+    a = tmp_path / "a.mp4"
+    a.write_bytes(b"fake-a")
+    out = tmp_path / "out.mp4"
+    tmpdir = out.parent / ".concat_tmp"
+
+    def fake_cut(self, inputs):
+        return ToolResult(
+            success=False,
+            error="Invalid cut interval (simulated); no artifact created.",
+            data={"operation": "cut"},
+        )
+
+    import unittest.mock as mock
+
+    with mock.patch.object(VideoTrimmer, "_cut", fake_cut):
+        result = VideoTrimmer().execute(
+            {
+                "operation": "concat",
+                "output_path": str(out),
+                "segments": [
+                    {"input_path": str(a), "start_seconds": 3, "end_seconds": 2}
+                ],
+            }
+        )
+    assert not result.success
+    assert result.data["failed_segment_index"] == 0
+    assert result.data["cleanup_attempted"] is True
+    assert not tmpdir.exists()
+    assert result.data["temp_dir_exists_after"] is False
+    assert a.is_file()
+
+
+def test_concat_cleanup_v2_cut_raises_segment0(tmp_path: Path, monkeypatch):
+    """v2.3: _cut raising on segment 0 preserves index 0."""
+    a = tmp_path / "a.mp4"
+    b = tmp_path / "b.mp4"
+    a.write_bytes(b"fake-a")
+    b.write_bytes(b"fake-b")
+    out = tmp_path / "out.mp4"
+
+    def boom(self, inputs):
+        raise RuntimeError("simulated FFmpeg failure: invalid explicit codec")
+
+    monkeypatch.setattr(VideoTrimmer, "_cut", boom)
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {"input_path": str(a), "start_seconds": 0, "end_seconds": 2},
+                {"input_path": str(b), "start_seconds": 0, "end_seconds": 2},
+            ],
+        }
+    )
+    assert not result.success
+    assert result.data["failed_segment_index"] == 0
+    assert result.data["segment_input"] == str(a)
+    assert result.data["final_output_created"] is False
+    assert "invalid explicit codec" in (result.error or "").lower()
+    assert "RuntimeError" in (result.error or "")
+    assert result.data["trim_exception_type"] == "RuntimeError"
+    assert not out.exists()
+    assert not (out.parent / ".concat_tmp").exists()
+
+
+def test_concat_cleanup_v2_cut_raises_middle_segment(tmp_path: Path, monkeypatch):
+    """v2.4: _cut raising on a middle segment preserves the right index."""
+    from tools.base_tool import ToolResult
+
+    files = []
+    for name in ("a.mp4", "b.mp4", "c.mp4"):
+        p = tmp_path / name
+        p.write_bytes(b"fake")
+        files.append(p)
+    out = tmp_path / "out.mp4"
+
+    def fake_cut(self, inputs):
+        op = inputs["output_path"]
+        if "seg_0001" in op:
+            raise RuntimeError("simulated FFmpeg failure on middle segment")
+        p = Path(op)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"good-temp")
+        return ToolResult(success=True, data={"operation": "cut"})
+
+    monkeypatch.setattr(VideoTrimmer, "_cut", fake_cut)
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {"input_path": str(files[0]), "start_seconds": 0, "end_seconds": 2},
+                {"input_path": str(files[1]), "start_seconds": 0, "end_seconds": 2},
+                {"input_path": str(files[2]), "start_seconds": 0, "end_seconds": 2},
+            ],
+        }
+    )
+    assert not result.success
+    assert result.data["failed_segment_index"] == 1
+    assert result.data["segment_input"] == str(files[1])
+    assert result.data["final_output_created"] is False
+    assert "middle segment" in (result.error or "")
+    assert not out.exists()
+
+
+def test_concat_cleanup_v2_later_segments_not_executed_after_raise(
+    tmp_path: Path, monkeypatch
+):
+    """v2.5: segments after a thrown trim exception never execute."""
+    from tools.base_tool import ToolResult
+
+    a = tmp_path / "a.mp4"
+    b = tmp_path / "b.mp4"
+    c = tmp_path / "c.mp4"
+    for p in (a, b, c):
+        p.write_bytes(b"fake")
+    out = tmp_path / "out.mp4"
+    cut_calls: list[str] = []
+
+    def fake_cut(self, inputs):
+        cut_calls.append(str(inputs["output_path"]))
+        if "seg_0000" in str(inputs["output_path"]):
+            raise RuntimeError("boom on segment 0")
+        p = Path(inputs["output_path"])
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"good")
+        return ToolResult(success=True, data={"operation": "cut"})
+
+    monkeypatch.setattr(VideoTrimmer, "_cut", fake_cut)
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {"input_path": str(a), "start_seconds": 0, "end_seconds": 1},
+                {"input_path": str(b), "start_seconds": 0, "end_seconds": 1},
+                {"input_path": str(c), "start_seconds": 0, "end_seconds": 1},
+            ],
+        }
+    )
+    assert not result.success
+    assert result.data["failed_segment_index"] == 0
+    assert len(cut_calls) == 1, f"only segment 0 may execute, saw: {cut_calls}"
+    assert "seg_0000" in cut_calls[0]
+    for p in (a, b, c):
+        assert p.is_file()
+
+
+def test_concat_cleanup_v2_join_not_executed_after_raise(
+    tmp_path: Path, monkeypatch
+):
+    """v2.6: final join never executes after a thrown trim exception."""
+    real_run = VideoTrimmer.run_command
+    calls: list[list[str]] = []
+
+    def spy_run(self, cmd: list[str], **kwargs):
+        calls.append(list(cmd))
+        return real_run(self, cmd, **kwargs)
+
+    monkeypatch.setattr(VideoTrimmer, "run_command", spy_run)
+
+    def boom(self, inputs):
+        raise RuntimeError("simulated trim exception blocks join")
+
+    monkeypatch.setattr(VideoTrimmer, "_cut", boom)
+    a = tmp_path / "a.mp4"
+    a.write_bytes(b"fake-a")
+    out = tmp_path / "out.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [{"input_path": str(a), "start_seconds": 0, "end_seconds": 2}],
+        }
+    )
+    assert not result.success
+    assert result.data["failed_segment_index"] == 0
+    assert not any("concat" in c for c in calls), (
+        f"failed trim must never reach the final join, saw: {calls}"
+    )
+    assert not out.exists()
+
+
+def test_concat_cleanup_v2_unlink_failure_does_not_mask(tmp_path: Path, monkeypatch):
+    """v2.7: cleanup unlink failure preserves the primary trim failure."""
+    from tools.base_tool import ToolResult
+
+    import tools.video.video_trimmer as vt_mod
+
+    a = tmp_path / "a.mp4"
+    b = tmp_path / "b.mp4"
+    a.write_bytes(b"fake-a")
+    b.write_bytes(b"fake-b")
+    out = tmp_path / "out.mp4"
+
+    def fake_cut(self, inputs):
+        op = str(inputs["output_path"])
+        if "seg_0000" in op:
+            p = Path(inputs["output_path"])
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(b"good-temp")
+            return ToolResult(success=True, data={"operation": "cut"})
+        return ToolResult(
+            success=False,
+            error="simulated sparse keyframe trim failure (primary)",
+            data={"operation": "cut", "keyframe_aligned": False},
+        )
+
+    monkeypatch.setattr(VideoTrimmer, "_cut", fake_cut)
+    monkeypatch.setattr(
+        vt_mod, "_try_remove_artifact", lambda p: (_ for _ in ()).throw(OSError("injected unlink failure"))
+    )
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {"input_path": str(a), "start_seconds": 0, "end_seconds": 2},
+                {"input_path": str(b), "start_seconds": 1.7, "end_seconds": 4.3},
+            ],
+        }
+    )
+    assert not result.success
+    # Primary trim failure remains authoritative, not the cleanup OSError.
+    assert "sparse keyframe trim failure (primary)" in (result.error or "")
+    assert "injected unlink failure" not in (result.error or "")
+    assert result.data["failed_segment_index"] == 1
+    assert result.data["trim_error"] is not None
+    assert "sparse keyframe" in (result.data["trim_error"] or "")
+    assert result.data["cleanup_attempted"] is True
+    for p in (a, b):
+        assert p.is_file(), "originals must survive cleanup failure"
+
+
+def test_concat_cleanup_v2_rmdir_failure_does_not_mask(tmp_path: Path, monkeypatch):
+    """v2.8: temp-dir removal failure preserves the primary trim failure."""
+    from tools.base_tool import ToolResult
+
+    a = tmp_path / "a.mp4"
+    a.write_bytes(b"fake-a")
+    out = tmp_path / "out.mp4"
+
+    def fake_cut(self, inputs):
+        p = Path(inputs["output_path"])
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"good-temp")
+        return ToolResult(success=True, data={"operation": "cut"})
+
+    # First segment succeeds; second has an invalid interval (primary failure).
+    # Force rmdir to fail so cleanup reports the dir as remaining.
+    real_cut = fake_cut
+
+    def routing_cut(self, inputs):
+        if "seg_0001" in str(inputs["output_path"]):
+            return ToolResult(
+                success=False,
+                error="Invalid cut interval (simulated primary); no artifact.",
+                data={"operation": "cut"},
+            )
+        return real_cut(self, inputs)
+
+    monkeypatch.setattr(VideoTrimmer, "_cut", routing_cut)
+    real_rmdir = Path.rmdir
+
+    def boom_rmdir(self):
+        raise OSError("injected rmdir failure")
+
+    monkeypatch.setattr(Path, "rmdir", boom_rmdir)
+    b = tmp_path / "b.mp4"
+    b.write_bytes(b"fake-b")
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {"input_path": str(a), "start_seconds": 0, "end_seconds": 2},
+                {"input_path": str(b), "start_seconds": 3, "end_seconds": 2},
+            ],
+        }
+    )
+    assert not result.success
+    assert "simulated primary" in (result.error or "")
+    assert "injected rmdir failure" not in (result.error or "")
+    assert result.data["failed_segment_index"] == 1
+    assert result.data["temp_dir_exists_after"] is True
+    assert result.data["cleanup_ok"] is False
+    assert a.is_file() and b.is_file()
+
+
+def test_concat_cleanup_v2_cleanup_failure_reports_remaining_truthfully(
+    tmp_path: Path, monkeypatch
+):
+    """v2.9: cleanup failure reports which paths remain without false claims."""
+    from tools.base_tool import ToolResult
+
+    import tools.video.video_trimmer as vt_mod
+
+    a = tmp_path / "a.mp4"
+    b = tmp_path / "b.mp4"
+    a.write_bytes(b"fake-a")
+    b.write_bytes(b"fake-b")
+    out = tmp_path / "out.mp4"
+
+    def fake_cut(self, inputs):
+        op = str(inputs["output_path"])
+        if "seg_0000" in op:
+            p = Path(inputs["output_path"])
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(b"good-temp")
+            return ToolResult(success=True, data={"operation": "cut"})
+        return ToolResult(
+            success=False,
+            error="simulated primary trim failure",
+            data={"operation": "cut"},
+        )
+
+    monkeypatch.setattr(VideoTrimmer, "_cut", fake_cut)
+    monkeypatch.setattr(
+        vt_mod, "_try_remove_artifact", lambda p: (False, True)
+    )
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {"input_path": str(a), "start_seconds": 0, "end_seconds": 2},
+                {"input_path": str(b), "start_seconds": 0, "end_seconds": 2},
+            ],
+        }
+    )
+    assert not result.success
+    assert "simulated primary trim failure" in (result.error or "")
+    details = result.data["temp_file_details"]
+    assert len(details) >= 1
+    assert any(d["exists_after"] is True for d in details)
+    assert any(d["removed"] is False for d in details)
+    remaining = result.data["cleanup_remaining_paths"]
+    assert any("seg_0000" in p for p in remaining), (
+        f"remaining paths must name the unremoved temp, saw: {remaining}"
+    )
+    assert result.data["cleanup_ok"] is False
+    assert "was removed" not in (result.error or "").lower()
+
+
+def test_concat_cleanup_v2_join_exception_preserved_with_clean_cleanup(
+    tmp_path: Path, monkeypatch
+):
+    """v2.10: final-join exception + clean cleanup preserves the join error."""
+    from tools.base_tool import ToolResult
+    from tools.base_tool import ToolCommandError
+
+    a = tmp_path / "a.mp4"
+    a.write_bytes(b"fake-a")
+    out = tmp_path / "out.mp4"
+
+    def fake_cut(self, inputs):
+        p = Path(inputs["output_path"])
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"good-temp")
+        return ToolResult(success=True, data={"operation": "cut"})
+
+    monkeypatch.setattr(VideoTrimmer, "_cut", fake_cut)
+
+    def boom_join(self, cmd: list[str], **kwargs):
+        raise ToolCommandError(1, cmd, detail="simulated join codec failure")
+
+    monkeypatch.setattr(VideoTrimmer, "run_command", boom_join)
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [{"input_path": str(a), "start_seconds": 0, "end_seconds": 2}],
+        }
+    )
+    assert not result.success
+    assert "concat join failed" in (result.error or "")
+    assert "simulated join codec failure" in (result.error or "")
+    assert result.data["final_output_created"] is False
+    assert result.data["cleanup_attempted"] is True
+    assert result.data["temp_dir_exists_after"] is False
+    assert list(tmp_path.rglob("seg_*.mp4")) == []
+    assert a.is_file()
+
+
+def test_concat_cleanup_v2_join_exception_plus_cleanup_failure_preserves_join(
+    tmp_path: Path, monkeypatch
+):
+    """v2.11: join exception + cleanup exception still preserves join error."""
+    from tools.base_tool import ToolResult
+    from tools.base_tool import ToolCommandError
+
+    import tools.video.video_trimmer as vt_mod
+
+    a = tmp_path / "a.mp4"
+    a.write_bytes(b"fake-a")
+    out = tmp_path / "out.mp4"
+
+    def fake_cut(self, inputs):
+        p = Path(inputs["output_path"])
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"good-temp")
+        return ToolResult(success=True, data={"operation": "cut"})
+
+    monkeypatch.setattr(VideoTrimmer, "_cut", fake_cut)
+
+    def boom_join(self, cmd: list[str], **kwargs):
+        raise ToolCommandError(1, cmd, detail="simulated primary join failure")
+
+    monkeypatch.setattr(VideoTrimmer, "run_command", boom_join)
+    monkeypatch.setattr(
+        vt_mod, "_try_remove_artifact", lambda p: (_ for _ in ()).throw(OSError("injected cleanup OSError"))
+    )
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [{"input_path": str(a), "start_seconds": 0, "end_seconds": 2}],
+        }
+    )
+    assert not result.success
+    assert "simulated primary join failure" in (result.error or "")
+    assert "injected cleanup OSError" not in (result.error or "")
+    assert result.data["final_output_created"] is False
+    assert result.data["cleanup_attempted"] is True
+    assert a.is_file(), "original must survive join+cleanup failures"
+
+
+def test_concat_cleanup_v2_originals_never_deleted(tmp_path: Path, monkeypatch):
+    """v2.12: original inputs survive trim failure, raise, and join failure."""
+    from tools.base_tool import ToolResult
+    from tools.base_tool import ToolCommandError
+
+    a = tmp_path / "orig_a.mp4"
+    b = tmp_path / "orig_b.mp4"
+    a.write_bytes(b"orig-a")
+    b.write_bytes(b"orig-b")
+
+    # Case 1: trim failure (no artifact).
+    def fail_cut(self, inputs):
+        return ToolResult(success=False, error="simulated primary failure", data={})
+
+    monkeypatch.setattr(VideoTrimmer, "_cut", fail_cut)
+    out1 = tmp_path / "o1.mp4"
+    r1 = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out1),
+            "segments": [{"input_path": str(a), "start_seconds": 0, "end_seconds": 1}],
+        }
+    )
+    assert not r1.success
+    assert a.is_file() and b.is_file()
+
+    # Case 2: trim raises.
+    def boom_cut(self, inputs):
+        raise RuntimeError("simulated raise")
+
+    monkeypatch.setattr(VideoTrimmer, "_cut", boom_cut)
+    out2 = tmp_path / "o2.mp4"
+    r2 = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out2),
+            "segments": [{"input_path": str(a), "start_seconds": 0, "end_seconds": 1}],
+        }
+    )
+    assert not r2.success
+    assert a.is_file() and b.is_file()
+
+    # Case 3: join failure after successful trims.
+    def ok_cut(self, inputs):
+        p = Path(inputs["output_path"])
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"good")
+        return ToolResult(success=True, data={})
+
+    monkeypatch.setattr(VideoTrimmer, "_cut", ok_cut)
+
+    def boom_join(self, cmd: list[str], **kwargs):
+        raise ToolCommandError(1, cmd, detail="join boom")
+
+    monkeypatch.setattr(VideoTrimmer, "run_command", boom_join)
+    out3 = tmp_path / "o3.mp4"
+    r3 = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out3),
+            "segments": [{"input_path": str(a)}, {"input_path": str(b)}],
+        }
+    )
+    assert not r3.success
+    assert a.is_file() and b.is_file()
+
+
+@needs_ffmpeg
+def test_concat_cleanup_v2_success_cleanup_unchanged(tmp_path: Path, dense_av: Path):
+    """v2.13: successful concat cleanup semantics unchanged (real FFmpeg)."""
+    out = tmp_path / "v2_ok.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [{"input_path": str(dense_av)}, {"input_path": str(dense_av)}],
+        }
+    )
+    assert result.success, result.error
+    assert out.is_file()
+    assert "video" in _streams_of(out)
+    assert result.data["cleanup_attempted"] is True
+    assert result.data["temp_dir_exists_after"] is False
+    assert result.data["cleanup_ok"] is True
+    assert result.data["cleanup_remaining_paths"] == []
+    assert not (out.parent / ".concat_tmp").exists()
+
+
+@needs_ffmpeg
+def test_concat_cleanup_v2_aligned_trimmed_unchanged(tmp_path: Path, dense_av: Path):
+    """v2.14: aligned trimmed concat still succeeds (real FFmpeg)."""
+    out = tmp_path / "v2_aligned.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {
+                    "input_path": str(dense_av),
+                    "start_seconds": 0,
+                    "end_seconds": 3,
+                },
+                {"input_path": str(dense_av)},
+            ],
+        }
+    )
+    assert result.success, result.error
+    assert out.is_file()
+    assert "video" in _streams_of(out)
+    assert not (out.parent / ".concat_tmp").exists()
+
+
+@needs_ffmpeg
+def test_concat_cleanup_v2_sparse_failure_unchanged(
+    tmp_path: Path, sparse_av: Path, dense_av: Path
+):
+    """v2.15: sparse/non-keyframe failure semantics unchanged (real FFmpeg)."""
+    out = tmp_path / "v2_sparse.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {
+                    "input_path": str(sparse_av),
+                    "start_seconds": 1.7,
+                    "end_seconds": 4.3,
+                },
+                {"input_path": str(dense_av)},
+            ],
+        }
+    )
+    assert not result.success
+    err = (result.error or "").lower()
+    assert "re-encode" in err and "libx264" in err
+    assert result.data["failed_segment_index"] == 0
+    assert result.data["final_output_created"] is False
+    assert not out.exists()
+    assert not (out.parent / ".concat_tmp").exists()
+    assert sparse_av.is_file() and dense_av.is_file()
+
+
+@needs_ffmpeg
+def test_concat_cleanup_v2_explicit_libx264_unchanged(
+    tmp_path: Path, sparse_av: Path, dense_av: Path
+):
+    """v2.16: explicit codec='libx264' re-encode trim still succeeds in concat."""
+    out = tmp_path / "v2_libx264.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "codec": "libx264",
+            "segments": [
+                {
+                    "input_path": str(sparse_av),
+                    "start_seconds": 1.7,
+                    "end_seconds": 4.3,
+                },
+                {
+                    "input_path": str(dense_av),
+                    "start_seconds": 0,
+                    "end_seconds": 2,
+                },
+            ],
+        }
+    )
+    assert result.success, result.error
+    assert out.is_file()
+    assert "video" in _streams_of(out)
+    assert not (out.parent / ".concat_tmp").exists()
+
+
+@needs_ffmpeg
+def test_concat_cleanup_v2_cut_production_unchanged(
+    tmp_path: Path, dense_av: Path, sparse_av: Path
+):
+    """v2.17: _cut production behavior unchanged by the concat repair."""
+    ok_out = tmp_path / "v2_cut_ok.mp4"
+    ok_result = VideoTrimmer().execute(
+        {
+            "operation": "cut",
+            "input_path": str(dense_av),
+            "output_path": str(ok_out),
+            "start_seconds": 0,
+            "end_seconds": 3,
+            "codec": "copy",
+        }
+    )
+    assert ok_result.success, ok_result.error
+    assert "video" in _streams_of(ok_out)
+    assert ok_result.data["keyframe_aligned"] is True
+
+    bad_out = tmp_path / "v2_cut_bad.mp4"
+    bad_result = VideoTrimmer().execute(
+        {
+            "operation": "cut",
+            "input_path": str(sparse_av),
+            "output_path": str(bad_out),
+            "start_seconds": 1.7,
+            "end_seconds": 4.3,
+            "codec": "copy",
+        }
+    )
+    assert not bad_result.success
+    assert not bad_out.exists()
+    assert bad_result.data["keyframe_aligned"] is False
+
+
+@needs_ffmpeg
+def test_concat_cleanup_v2_speed_unchanged(tmp_path: Path, dense_av: Path):
+    """v2.18: _speed unchanged by the concat repair."""
+    out = tmp_path / "v2_fast.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "speed",
+            "input_path": str(dense_av),
+            "output_path": str(out),
+            "speed_factor": 2.0,
+        }
+    )
+    assert result.success, result.error
+    streams = _streams_of(out)
+    assert "video" in streams and "audio" in streams
+    assert result.data["speed_factor"] == 2.0

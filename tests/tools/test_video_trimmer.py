@@ -3518,3 +3518,620 @@ def test_concat_v4_speed_contract_unchanged(tmp_path: Path, dense_av: Path, monk
     assert result.data["speed_factor"] == 2.0
     assert result.data["output"] == str(out)
     assert len(seen) == 1
+
+
+# ---------------------------------------------------------------------------
+# v5 (F2 corrective repair): concat cleanup diagnostics must truthfully
+# attribute the failing filesystem operation. No behavior change: cleanup
+# stays best-effort, the primary trim/join error stays primary, and
+# cleanup_ok/uncertainty semantics are unchanged.
+# ---------------------------------------------------------------------------
+
+def _v5_primary_trim_failure(monkeypatch, fail_on="seg_0001"):
+    """Install a fake _cut: seg temps succeed except fail_on, which fails.
+
+    Returns the fake so tests can introspect if needed. No FFmpeg runs.
+    """
+    from tools.base_tool import ToolResult
+
+    def fake_cut(self, inputs):
+        if fail_on in str(inputs["output_path"]):
+            return ToolResult(
+                success=False,
+                error="simulated primary trim failure v5",
+                data={"operation": "cut"},
+            )
+        p = Path(inputs["output_path"])
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"good-temp-v5")
+        return ToolResult(success=True, data={"operation": "cut"})
+
+    monkeypatch.setattr(VideoTrimmer, "_cut", fake_cut)
+    return fake_cut
+
+
+def _v5_run_trim_failure(tmp_path: Path, monkeypatch, probe_message=None):
+    """Run a 2-trimmed-segment concat whose seg_0001 trim fails.
+
+    When probe_message is given, the concat-local exists/stat verification
+    probe reports OSError uncertainty with that message for .concat_tmp
+    paths (equivalent to Path.exists() raising OSError during cleanup
+    verification), while all other filesystem behavior stays real.
+    """
+    import tools.video.video_trimmer as vt_mod
+
+    _v5_primary_trim_failure(monkeypatch)
+    if probe_message is not None:
+        real_probe = vt_mod._concat_exists_probe
+
+        def fake_probe(path):
+            if ".concat_tmp" in str(path):
+                return None, {
+                    "operation": "exists",
+                    "path": str(path),
+                    "error_type": "OSError",
+                    "error_message": probe_message,
+                }
+            return real_probe(path)
+
+        monkeypatch.setattr(vt_mod, "_concat_exists_probe", fake_probe)
+    a = tmp_path / "a.mp4"
+    b = tmp_path / "b.mp4"
+    a.write_bytes(b"fake-a")
+    b.write_bytes(b"fake-b")
+    out = tmp_path / "out.mp4"
+    return VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {"input_path": str(a), "start_seconds": 0, "end_seconds": 1},
+                {"input_path": str(b), "start_seconds": 0, "end_seconds": 1},
+            ],
+        }
+    )
+
+
+def test_concat_v5_exists_failure_operation_identified_structurally(
+    tmp_path: Path, monkeypatch
+):
+    """v5.1 (F2): exists/stat failure exposes its operation structurally."""
+    result = _v5_run_trim_failure(
+        tmp_path, monkeypatch, probe_message="injected-exists-op-v5"
+    )
+    assert not result.success
+    details = result.data["temp_file_details"]
+    assert len(details) >= 1
+    for d in details:
+        assert d.get("operation") in ("exists", "stat", "verify_exists"), d
+        assert d.get("error_type") is not None, d
+        assert d.get("error_message") is not None, d
+        assert d.get("cleanup_error") is not None, d
+
+
+def test_concat_v5_exists_failure_error_type_structural(
+    tmp_path: Path, monkeypatch
+):
+    """v5.2 (F2): exists/stat failure exposes its exception type."""
+    result = _v5_run_trim_failure(
+        tmp_path, monkeypatch, probe_message="injected-exists-type-v5"
+    )
+    assert not result.success
+    details = result.data["temp_file_details"]
+    assert any(d.get("error_type") == "OSError" for d in details)
+    for d in details:
+        assert (d.get("verification_error") or {}).get("error_type") == "OSError", d
+
+
+def test_concat_v5_exists_failure_error_message_structural(
+    tmp_path: Path, monkeypatch
+):
+    """v5.3 (F2): exists/stat failure exposes its exception message."""
+    result = _v5_run_trim_failure(
+        tmp_path, monkeypatch, probe_message="injected-exists-msg-v5"
+    )
+    assert not result.success
+    details = result.data["temp_file_details"]
+    assert any(
+        "injected-exists-msg-v5" in (d.get("error_message") or "")
+        for d in details
+    )
+    assert "injected-exists-msg-v5" in (result.data["cleanup_error"] or "")
+
+
+def test_concat_v5_exists_failure_path_correct(tmp_path: Path, monkeypatch):
+    """v5.4 (F2): the attributed path is the affected temp artifact."""
+    result = _v5_run_trim_failure(
+        tmp_path, monkeypatch, probe_message="injected-exists-path-v5"
+    )
+    assert not result.success
+    details = result.data["temp_file_details"]
+    assert len(details) >= 1
+    for d in details:
+        assert ".concat_tmp" in d.get("path", ""), d
+        assert (d.get("verification_error") or {}).get("path") == d.get("path"), d
+
+
+def test_concat_v5_exists_failure_existence_unknown(
+    tmp_path: Path, monkeypatch
+):
+    """v5.5 (F2): exists/stat uncertainty keeps existence_unknown=True."""
+    result = _v5_run_trim_failure(
+        tmp_path, monkeypatch, probe_message="injected-exists-unknown-v5"
+    )
+    assert not result.success
+    details = result.data["temp_file_details"]
+    assert any(d.get("existence_unknown") is True for d in details)
+    assert result.data["cleanup_ok"] is False
+
+
+def test_concat_v5_primary_trim_error_remains_primary(
+    tmp_path: Path, monkeypatch
+):
+    """v5.6 (F2): cleanup diagnostics never mask the primary trim error."""
+    result = _v5_run_trim_failure(
+        tmp_path, monkeypatch, probe_message="injected-exists-primary-v5"
+    )
+    assert not result.success
+    assert "simulated primary trim failure v5" in (result.error or "")
+    assert "injected-exists-primary-v5" not in (result.error or "")
+    assert result.data["failed_segment_index"] == 1
+    assert result.data["final_output_created"] is False
+
+
+def test_concat_v5_exists_failure_cleanup_not_ok(tmp_path: Path, monkeypatch):
+    """v5.7 (F2): exists/stat uncertainty forces cleanup_ok=False."""
+    result = _v5_run_trim_failure(
+        tmp_path, monkeypatch, probe_message="injected-exists-cleanup-v5"
+    )
+    assert not result.success
+    assert result.data["cleanup_attempted"] is True
+    assert result.data["cleanup_ok"] is False
+    assert result.data["cleanup_error"] is not None
+
+
+def test_concat_v5_unlink_oserror_attribution_structural(
+    tmp_path: Path, monkeypatch
+):
+    """v5.8 (F2): unlink OSError keeps truthful unlink attribution."""
+    a = tmp_path / "a.mp4"
+    b = tmp_path / "b.mp4"
+    a.write_bytes(b"fake-a")
+    b.write_bytes(b"fake-b")
+    out = tmp_path / "out.mp4"
+    _v5_primary_trim_failure(monkeypatch)
+
+    real_unlink = Path.unlink
+
+    def boom_unlink(self, *args, **kwargs):
+        if ".concat_tmp" in str(self):
+            raise OSError("boom-unlink-v5")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", boom_unlink)
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {"input_path": str(a), "start_seconds": 0, "end_seconds": 1},
+                {"input_path": str(b), "start_seconds": 0, "end_seconds": 1},
+            ],
+        }
+    )
+    assert not result.success
+    assert "simulated primary trim failure v5" in (result.error or "")
+    assert "boom-unlink-v5" not in (result.error or "")
+    assert result.data["cleanup_ok"] is False
+    details = result.data["temp_file_details"]
+    unlink_details = [d for d in details if d.get("operation") == "unlink"]
+    assert len(unlink_details) >= 1
+    assert any(d.get("error_type") == "OSError" for d in unlink_details)
+    assert any("boom-unlink-v5" in (d.get("error_message") or "") for d in unlink_details)
+    assert any("boom-unlink-v5" in (d.get("cleanup_error") or "") for d in unlink_details)
+    assert "boom-unlink-v5" in (result.data["cleanup_error"] or "")
+    assert a.is_file() and b.is_file()
+
+
+def test_concat_v5_rmdir_oserror_attribution_structural(
+    tmp_path: Path, monkeypatch
+):
+    """v5.9 (F2): rmdir OSError keeps truthful rmdir attribution."""
+    a = tmp_path / "a.mp4"
+    b = tmp_path / "b.mp4"
+    a.write_bytes(b"fake-a")
+    b.write_bytes(b"fake-b")
+    out = tmp_path / "out.mp4"
+    _v5_primary_trim_failure(monkeypatch)
+
+    def boom_rmdir(self):
+        raise OSError("boom-rmdir-v5")
+
+    monkeypatch.setattr(Path, "rmdir", boom_rmdir)
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {"input_path": str(a), "start_seconds": 0, "end_seconds": 1},
+                {"input_path": str(b), "start_seconds": 0, "end_seconds": 1},
+            ],
+        }
+    )
+    assert not result.success
+    assert "simulated primary trim failure v5" in (result.error or "")
+    assert "boom-rmdir-v5" not in (result.error or "")
+    assert result.data["temp_dir_exists_after"] is True
+    assert result.data["cleanup_ok"] is False
+    assert "boom-rmdir-v5" in (result.data["cleanup_error"] or "")
+    details = result.data["temp_file_details"]
+    rmdir_details = [d for d in details if d.get("operation") == "rmdir"]
+    assert len(rmdir_details) >= 1
+    assert any(d.get("error_type") == "OSError" for d in rmdir_details)
+    assert any("boom-rmdir-v5" in (d.get("error_message") or "") for d in rmdir_details)
+    assert a.is_file() and b.is_file()
+
+
+def test_concat_v5_list_cleanup_exception_attribution_structural(
+    tmp_path: Path, monkeypatch
+):
+    """v5.10 (F2): concat-list removal failure is structured, not text-only."""
+    from tools.base_tool import ToolCommandError
+
+    a = tmp_path / "a.mp4"
+    b = tmp_path / "b.mp4"
+    a.write_bytes(b"fake-a")
+    b.write_bytes(b"fake-b")
+    out = tmp_path / "out.mp4"
+
+    def boom_join(self, cmd: list[str], **kwargs):
+        raise ToolCommandError(1, cmd, detail="simulated join failure v5")
+
+    real_unlink = Path.unlink
+
+    def boom_list_unlink(self, *args, **kwargs):
+        if "concat_list" in str(self):
+            raise OSError("boom-list-unlink-v5")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(VideoTrimmer, "run_command", boom_join)
+    monkeypatch.setattr(Path, "unlink", boom_list_unlink)
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [{"input_path": str(a)}, {"input_path": str(b)}],
+        }
+    )
+    assert not result.success
+    assert "concat join failed" in (result.error or "")
+    assert "boom-list-unlink-v5" not in (result.error or "")
+    assert result.data["cleanup_ok"] is False
+    list_detail = result.data.get("concat_list_detail")
+    assert isinstance(list_detail, dict), result.data
+    assert list_detail.get("operation") == "unlink", list_detail
+    assert list_detail.get("error_type") == "OSError", list_detail
+    assert "boom-list-unlink-v5" in (list_detail.get("error_message") or ""), list_detail
+    assert "concat_list" in list_detail.get("path", ""), list_detail
+    assert "boom-list-unlink-v5" in (result.data["cleanup_error"] or "")
+    assert a.is_file() and b.is_file()
+
+
+def test_concat_v5_tempdir_exists_failure_structural(tmp_path: Path, monkeypatch):
+    """v5 (F2 extra): temp-dir exists/stat failure is structured."""
+    a = tmp_path / "a.mp4"
+    b = tmp_path / "b.mp4"
+    a.write_bytes(b"fake-a")
+    b.write_bytes(b"fake-b")
+    out = tmp_path / "out.mp4"
+    _v5_primary_trim_failure(monkeypatch)
+    temp_dir = out.parent / ".concat_tmp"
+    real_exists = Path.exists
+
+    def fake_exists(self):
+        if str(self) == str(temp_dir):
+            raise OSError("injected-tempdir-exists-v5")
+        return real_exists(self)
+
+    monkeypatch.setattr(Path, "exists", fake_exists)
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {"input_path": str(a), "start_seconds": 0, "end_seconds": 1},
+                {"input_path": str(b), "start_seconds": 0, "end_seconds": 1},
+            ],
+        }
+    )
+    assert not result.success
+    assert "simulated primary trim failure v5" in (result.error or "")
+    assert result.data["temp_dir_exists_after"] is True
+    assert result.data["cleanup_ok"] is False
+    dir_err = result.data.get("temp_dir_exists_error")
+    assert isinstance(dir_err, dict), result.data
+    assert dir_err.get("operation") == "exists", dir_err
+    assert dir_err.get("error_type") == "OSError", dir_err
+    assert "injected-tempdir-exists-v5" in (dir_err.get("error_message") or ""), dir_err
+    assert dir_err.get("path") == str(temp_dir), dir_err
+    assert "injected-tempdir-exists-v5" in (result.data["cleanup_error"] or "")
+
+
+def test_concat_v5_successful_cleanup_has_no_stale_attribution(
+    tmp_path: Path, monkeypatch
+):
+    """v5.11 (F2): success carries no error attribution anywhere."""
+    a = tmp_path / "a.mp4"
+    b = tmp_path / "b.mp4"
+    a.write_bytes(b"fake-a")
+    b.write_bytes(b"fake-b")
+    out = tmp_path / "out.mp4"
+
+    def fake_join(self, cmd: list[str], **kwargs):
+        Path(cmd[-1]).write_bytes(b"JOINED-v5")
+        return None
+
+    monkeypatch.setattr(VideoTrimmer, "run_command", fake_join)
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [{"input_path": str(a)}, {"input_path": str(b)}],
+        }
+    )
+    assert result.success, result.error
+    assert out.is_file()
+    assert result.data["cleanup_ok"] is True
+    assert result.data["cleanup_error"] is None
+    for d in result.data["temp_file_details"]:
+        assert d.get("error_type") is None, d
+        assert d.get("error_message") is None, d
+        assert d.get("cleanup_error") is None, d
+        assert d.get("verification_error") is None, d
+    list_detail = result.data.get("concat_list_detail")
+    assert isinstance(list_detail, dict), result.data
+    assert list_detail.get("error_type") is None, list_detail
+    assert list_detail.get("removed") is True, list_detail
+    assert result.data.get("temp_dir_exists_error") is None, result.data
+    assert not (out.parent / ".concat_tmp").exists()
+
+
+def test_concat_v5_sequential_cleanup_does_not_leak_state(
+    tmp_path: Path, monkeypatch
+):
+    """v5.12 (F2): a failed cleanup never leaks into the next invocation."""
+    from tools.base_tool import ToolResult
+
+    a = tmp_path / "a.mp4"
+    b = tmp_path / "b.mp4"
+    a.write_bytes(b"fake-a")
+    b.write_bytes(b"fake-b")
+    out1 = tmp_path / "out1.mp4"
+
+    def failing_cut(self, inputs):
+        if "seg_0001" in str(inputs["output_path"]):
+            return ToolResult(
+                success=False, error="first-run trim failure v5", data={}
+            )
+        p = Path(inputs["output_path"])
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"good-temp-v5")
+        return ToolResult(success=True, data={"operation": "cut"})
+
+    monkeypatch.setattr(VideoTrimmer, "_cut", failing_cut)
+    first = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out1),
+            "segments": [
+                {"input_path": str(a), "start_seconds": 0, "end_seconds": 1},
+                {"input_path": str(b), "start_seconds": 0, "end_seconds": 1},
+            ],
+        }
+    )
+    assert not first.success
+    # Primary trim failure with fully successful cleanup: the two states
+    # are independent (cleanup_ok=True does not imply concat success).
+    assert first.data["cleanup_ok"] is True
+    assert first.data["cleanup_error"] is None
+
+    def fake_join(self, cmd: list[str], **kwargs):
+        Path(cmd[-1]).write_bytes(b"JOINED-v5-second")
+        return None
+
+    monkeypatch.setattr(VideoTrimmer, "run_command", fake_join)
+    out2 = tmp_path / "out2.mp4"
+    second = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out2),
+            "segments": [{"input_path": str(a)}, {"input_path": str(b)}],
+        }
+    )
+    assert second.success, second.error
+    assert second.data["cleanup_ok"] is True
+    assert second.data["cleanup_error"] is None
+    blob = str(second.data)
+    assert "first-run trim failure v5" not in blob
+    for d in second.data["temp_file_details"]:
+        assert d.get("error_type") is None, d
+        assert d.get("verification_error") is None, d
+
+
+def test_concat_v5_ownership_foreign_files_untouched(tmp_path: Path, monkeypatch):
+    """v5.13: ownership scope unchanged — foreign temps never touched."""
+    a = tmp_path / "a.mp4"
+    b = tmp_path / "b.mp4"
+    a.write_bytes(b"fake-a")
+    b.write_bytes(b"fake-b")
+    out = tmp_path / "out.mp4"
+    ctmp = tmp_path / ".concat_tmp"
+    ctmp.mkdir(parents=True, exist_ok=True)
+    foreign = ctmp / "foreign.bin"
+    foreign.write_bytes(b"FOREIGN-SENTINEL-v5")
+    _v5_primary_trim_failure(monkeypatch)
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {"input_path": str(a), "start_seconds": 0, "end_seconds": 1},
+                {"input_path": str(b), "start_seconds": 0, "end_seconds": 1},
+            ],
+        }
+    )
+    assert not result.success
+    assert foreign.is_file()
+    assert foreign.read_bytes() == b"FOREIGN-SENTINEL-v5"
+    owned = [d["path"] for d in result.data["temp_file_details"]]
+    assert str(foreign) not in owned
+    assert str(foreign) not in (result.data["cleanup_remaining_paths"] or [])
+    assert a.is_file() and b.is_file()
+
+
+def test_concat_v5_malformed_segment_cleanup_unchanged(tmp_path: Path, monkeypatch):
+    """v5.14: malformed-segment guard/cleanup contract unchanged."""
+    from tools.base_tool import ToolResult
+
+    a = tmp_path / "a.mp4"
+    a.write_bytes(b"fake-a")
+    out = tmp_path / "out.mp4"
+    join_calls: list[list[str]] = []
+
+    def ok_cut(self, inputs):
+        p = Path(inputs["output_path"])
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"good-temp-v5")
+        return ToolResult(success=True, data={"operation": "cut"})
+
+    def spy_join(self, cmd: list[str], **kwargs):
+        join_calls.append(list(cmd))
+        return None
+
+    monkeypatch.setattr(VideoTrimmer, "_cut", ok_cut)
+    monkeypatch.setattr(VideoTrimmer, "run_command", spy_join)
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {"input_path": str(a), "start_seconds": 0, "end_seconds": 1},
+                {"not": "a-segment"},
+            ],
+        }
+    )
+    assert not result.success
+    assert result.data["failed_segment_index"] == 1
+    assert result.data["malformed_segment"] is True
+    assert result.data["final_output_created"] is False
+    assert join_calls == [], "join must not run after a malformed segment"
+    assert list(tmp_path.rglob("seg_*.mp4")) == []
+    assert not (tmp_path / ".concat_tmp").exists()
+    assert a.is_file()
+
+
+def test_concat_v5_partial_output_cleanup_unchanged(tmp_path: Path, monkeypatch):
+    """v5.15: partial-output (O4) cleanup contract unchanged."""
+    from tools.base_tool import ToolCommandError
+
+    a = tmp_path / "a.mp4"
+    a.write_bytes(b"fake-a")
+    out = tmp_path / "out.mp4"
+
+    def flaky_join(self, cmd: list[str], **kwargs):
+        Path(cmd[-1]).write_bytes(b"PARTIAL-v5")
+        raise ToolCommandError(1, cmd, detail="simulated join failure v5")
+
+    monkeypatch.setattr(VideoTrimmer, "run_command", flaky_join)
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [{"input_path": str(a)}],
+        }
+    )
+    assert not result.success
+    assert "concat join failed" in (result.error or "")
+    assert result.data["output_existed_before"] is False
+    assert result.data["output_created_by_invocation"] is True
+    assert result.data["partial_output_removed"] is True
+    assert result.data["partial_output_exists_after"] is False
+    assert result.data["final_output_created"] is False
+    assert not out.exists()
+    assert a.is_file()
+
+
+def test_concat_v5_normal_concat_unchanged(tmp_path: Path, monkeypatch):
+    """v5.16: normal concat success path unchanged."""
+    a = tmp_path / "a.mp4"
+    b = tmp_path / "b.mp4"
+    a.write_bytes(b"fake-a")
+    b.write_bytes(b"fake-b")
+    out = tmp_path / "out.mp4"
+
+    def fake_join(self, cmd: list[str], **kwargs):
+        assert cmd[0] == "ffmpeg"
+        assert "-i" in cmd
+        Path(cmd[-1]).write_bytes(b"JOINED-v5-normal")
+        return None
+
+    monkeypatch.setattr(VideoTrimmer, "run_command", fake_join)
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [{"input_path": str(a)}, {"input_path": str(b)}],
+        }
+    )
+    assert result.success, result.error
+    assert out.is_file()
+    assert out.read_bytes() == b"JOINED-v5-normal"
+    assert result.data["cleanup_ok"] is True
+    assert not (out.parent / ".concat_tmp").exists()
+    assert a.read_bytes() == b"fake-a" and b.read_bytes() == b"fake-b"
+
+
+def test_concat_v5_cut_contract_unchanged(tmp_path: Path, dense_av: Path, monkeypatch):
+    """v5.17: _cut() interval validation still rejects before FFmpeg."""
+    def _must_not_run(self, cmd: list[str], **kwargs):
+        raise AssertionError("FFmpeg must not run for an invalid interval")
+
+    monkeypatch.setattr(VideoTrimmer, "run_command", _must_not_run)
+    out = tmp_path / "v5_cut_bad.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "cut",
+            "input_path": str(dense_av),
+            "output_path": str(out),
+            "start_seconds": 4.0,
+            "end_seconds": 2.0,
+            "codec": "copy",
+        }
+    )
+    assert not result.success
+    assert "end_seconds" in (result.error or "")
+    assert not out.exists(), "invalid interval must not create an artifact"
+
+
+def test_concat_v5_speed_contract_unchanged(tmp_path: Path, dense_av: Path, monkeypatch):
+    """v5.18: _speed() contract unchanged (factor echo, output record)."""
+    seen: list[list[str]] = []
+
+    def fake_run(self, cmd: list[str], **kwargs):
+        seen.append(list(cmd))
+        return None
+
+    monkeypatch.setattr(VideoTrimmer, "run_command", fake_run)
+    out = tmp_path / "v5_speed.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "speed",
+            "input_path": str(dense_av),
+            "output_path": str(out),
+            "speed_factor": 2.0,
+        }
+    )
+    assert result.success, result.error
+    assert result.data["speed_factor"] == 2.0
+    assert result.data["output"] == str(out)
+    assert len(seen) == 1

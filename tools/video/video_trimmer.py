@@ -401,6 +401,11 @@ def _concat_remove_artifact(path: Path) -> tuple[dict[str, Any], list[str]]:
         "error_type": None,
         "error_message": None,
         "cleanup_error": None,
+        # Structured verification subrecord (Option B): populated when the
+        # post-removal exists/stat probe itself raises. The top-level
+        # operation/error_type/error_message/cleanup_error must never
+        # misleadingly imply that no error occurred (F2 v5).
+        "verification_error": None,
     }
     problems: list[str] = []
 
@@ -412,19 +417,58 @@ def _concat_remove_artifact(path: Path) -> tuple[dict[str, Any], list[str]]:
         detail["cleanup_error"] = f"{etype}: {emsg}"
         problems.append(f"{path}: unlink failed: {etype}: {emsg}")
 
+    def _record_exists_verification_failure(
+        sdiag: dict[str, str], context: str
+    ) -> None:
+        """Attribute an exists/stat verification failure truthfully (F2 v5).
+
+        Always exposes the verification exception structurally in
+        ``verification_error`` (plus legacy ``exists_error_*`` keys). When
+        no unlink error was recorded, the verification failure is promoted
+        to the top-level operation/error fields (Option A). When an unlink
+        error is already recorded, the top-level keeps the unlink
+        attribution and the verification failure is appended to
+        ``cleanup_error`` so no captured exception survives only as
+        free-form problems text.
+        """
+        etype = sdiag["error_type"]
+        emsg = sdiag["error_message"]
+        op = sdiag["operation"]
+        detail["existence_unknown"] = True
+        detail["exists_after"] = True
+        detail["removed"] = False
+        detail["exists_error_type"] = etype
+        detail["exists_error_message"] = emsg
+        detail["verification_error"] = {
+            "operation": op,
+            "path": str(path),
+            "error_type": etype,
+            "error_message": emsg,
+        }
+        if detail.get("error_type") is None:
+            detail["operation"] = op
+            detail["error_type"] = etype
+            detail["error_message"] = emsg
+            detail["cleanup_error"] = f"{etype}: {emsg}"
+        else:
+            try:
+                prev = detail.get("cleanup_error")
+            except Exception:
+                prev = None
+            suffix = f"{path}: exists/stat failed: {etype}: {emsg}"
+            try:
+                detail["cleanup_error"] = (
+                    f"{prev}; {suffix}" if prev else suffix
+                )
+            except Exception:
+                pass
+        problems.append(f"{path}: {context}: {etype}: {emsg}")
+
     def _verify_post_state(unlink_failed: bool) -> None:
         """Direct post-state verification with stat-error capture."""
         still, sdiag = _concat_exists_probe(path)
         if sdiag is not None:
-            detail["existence_unknown"] = True
-            detail["exists_after"] = True
-            detail["removed"] = False
-            detail["exists_error_type"] = sdiag["error_type"]
-            detail["exists_error_message"] = sdiag["error_message"]
-            problems.append(
-                f"{path}: exists/stat failed: "
-                f"{sdiag['error_type']}: {sdiag['error_message']}"
-            )
+            _record_exists_verification_failure(sdiag, "exists/stat failed")
             return
         assert still is not None
         detail["exists_after"] = bool(still)
@@ -489,16 +533,11 @@ def _concat_remove_artifact(path: Path) -> tuple[dict[str, Any], list[str]]:
         # directly and report the seam's verdict truthfully.
         still, sdiag = _concat_exists_probe(path)
         if sdiag is not None:
-            detail["existence_unknown"] = True
-            detail["exists_after"] = True
-            detail["removed"] = False
-            detail["exists_error_type"] = sdiag["error_type"]
-            detail["exists_error_message"] = sdiag["error_message"]
-            problems.append(
-                f"{path}: unlink reported removed={reported_removed} "
+            _record_exists_verification_failure(
+                sdiag,
+                f"unlink reported removed={reported_removed} "
                 f"exists_after={reported_exists_after}; verification "
-                f"stat failed: {sdiag['error_type']}: "
-                f"{sdiag['error_message']}"
+                "stat failed",
             )
         else:
             assert still is not None
@@ -1392,6 +1431,7 @@ class VideoTrimmer(BaseTool):
                                         "error_type": type(e).__name__,
                                         "error_message": str(e),
                                         "cleanup_error": f"{type(e).__name__}: {e}",
+                                        "verification_error": None,
                                     }
                                 )
                             except Exception:
@@ -1417,6 +1457,7 @@ class VideoTrimmer(BaseTool):
                                     "error_type": type(e).__name__,
                                     "error_message": str(e),
                                     "cleanup_error": f"{type(e).__name__}: {e}",
+                                    "verification_error": None,
                                 }
                             )
                         except Exception:
@@ -1426,6 +1467,12 @@ class VideoTrimmer(BaseTool):
                         )
                 list_removed: Optional[bool] = None
                 list_exists_after = False
+                # Structured concat-list removal diagnostic (F2 v5): the
+                # full per-path record is preserved here instead of
+                # surviving only as free-form cleanup_error text.
+                list_detail_structured: Optional[dict[str, Any]] = None
+                # Structured temp-dir exists/stat diagnostic (F2 v5).
+                temp_dir_exists_error: Optional[dict[str, str]] = None
                 # Only the concat list actually created by this invocation
                 # is cleanup-owned; a pre-existing foreign file is never
                 # touched (O1).
@@ -1437,7 +1484,23 @@ class VideoTrimmer(BaseTool):
                             )
                         except Exception as e:
                             # The helper is non-raising; defense in depth.
+                            # Structured attribution (F2 v5): the concat-list
+                            # cleanup exception must not survive only as
+                            # free-form text.
                             list_removed, list_exists_after = False, True
+                            list_detail_structured = {
+                                "path": str(list_path_used),
+                                "operation": "unlink",
+                                "removed": False,
+                                "exists_after": True,
+                                "existence_unknown": True,
+                                "error_type": type(e).__name__,
+                                "error_message": str(e),
+                                "cleanup_error": (
+                                    f"{type(e).__name__}: {e}"
+                                ),
+                                "verification_error": None,
+                            }
                             problems.append(
                                 f"{list_path_used}: unlink raised "
                                 f"{type(e).__name__}: {e}"
@@ -1453,8 +1516,25 @@ class VideoTrimmer(BaseTool):
                                 if list_detail.get("existence_unknown"):
                                     list_exists_after = True
                                 problems.extend(list_problems)
+                                try:
+                                    list_detail_structured = dict(list_detail)
+                                except Exception:
+                                    list_detail_structured = None
                             except Exception as e:
                                 list_removed, list_exists_after = False, True
+                                list_detail_structured = {
+                                    "path": str(list_path_used),
+                                    "operation": "unlink",
+                                    "removed": False,
+                                    "exists_after": True,
+                                    "existence_unknown": True,
+                                    "error_type": type(e).__name__,
+                                    "error_message": str(e),
+                                    "cleanup_error": (
+                                        f"{type(e).__name__}: {e}"
+                                    ),
+                                    "verification_error": None,
+                                }
                                 problems.append(
                                     f"{list_path_used}: list-removal "
                                     f"accounting failed: "
@@ -1467,6 +1547,22 @@ class VideoTrimmer(BaseTool):
                         )
                         list_removed = None
                         list_exists_after = True
+                        try:
+                            list_detail_structured = {
+                                "path": str(list_path_used),
+                                "operation": "unlink",
+                                "removed": False,
+                                "exists_after": True,
+                                "existence_unknown": True,
+                                "error_type": type(e).__name__,
+                                "error_message": str(e),
+                                "cleanup_error": (
+                                    f"{type(e).__name__}: {e}"
+                                ),
+                                "verification_error": None,
+                            }
+                        except Exception:
+                            pass
                 try:
                     try:
                         temp_dir.rmdir()
@@ -1490,6 +1586,7 @@ class VideoTrimmer(BaseTool):
                                     "cleanup_error": (
                                         f"{type(e).__name__}: {e}"
                                     ),
+                                    "verification_error": None,
                                 }
                             )
                         except Exception:
@@ -1512,6 +1609,7 @@ class VideoTrimmer(BaseTool):
                                     "cleanup_error": (
                                         f"{type(e).__name__}: {e}"
                                     ),
+                                    "verification_error": None,
                                 }
                             )
                         except Exception:
@@ -1520,12 +1618,38 @@ class VideoTrimmer(BaseTool):
                     problems.append(
                         f"temp_dir removal failed: {type(e).__name__}: {e}"
                     )
+                    # Structured directory-removal attribution (F2 v5).
+                    try:
+                        file_details.append(
+                            {
+                                "path": str(temp_dir),
+                                "operation": "rmdir",
+                                "removed": False,
+                                "exists_after": True,
+                                "existence_unknown": False,
+                                "error_type": type(e).__name__,
+                                "error_message": str(e),
+                                "cleanup_error": (
+                                    f"{type(e).__name__}: {e}"
+                                ),
+                                "verification_error": None,
+                            }
+                        )
+                    except Exception:
+                        pass
                 try:
                     temp_dir_exists_after = temp_dir.exists()
                 except Exception as e:
                     # Existence uncertainty: conservatively report present
-                    # and preserve the filesystem diagnostic (F2 v4).
+                    # and preserve the filesystem diagnostic structurally
+                    # (F2 v5) as well as in text.
                     temp_dir_exists_after = True
+                    temp_dir_exists_error = {
+                        "operation": "exists",
+                        "path": str(temp_dir),
+                        "error_type": type(e).__name__,
+                        "error_message": str(e),
+                    }
                     problems.append(
                         f"{temp_dir}: exists/stat failed: "
                         f"{type(e).__name__}: {e}"
@@ -1568,7 +1692,9 @@ class VideoTrimmer(BaseTool):
                     "temp_file_details": file_details,
                     "concat_list_removed": list_removed,
                     "concat_list_exists_after": list_exists_after,
+                    "concat_list_detail": list_detail_structured,
                     "temp_dir_exists_after": temp_dir_exists_after,
+                    "temp_dir_exists_error": temp_dir_exists_error,
                     "cleanup_error": cleanup_error,
                     "cleanup_remaining_paths": remaining,
                     "cleanup_ok": cleanup_ok,
@@ -1587,7 +1713,9 @@ class VideoTrimmer(BaseTool):
                     "temp_file_details": [],
                     "concat_list_removed": None,
                     "concat_list_exists_after": True,
+                    "concat_list_detail": None,
                     "temp_dir_exists_after": td_exists,
+                    "temp_dir_exists_error": None,
                     "cleanup_error": (
                         f"cleanup helper failed: {type(e).__name__}: {e}"
                     ),
@@ -1613,7 +1741,9 @@ class VideoTrimmer(BaseTool):
                     "temp_file_details": [],
                     "concat_list_removed": None,
                     "concat_list_exists_after": True,
+                    "concat_list_detail": None,
                     "temp_dir_exists_after": td_exists,
+                    "temp_dir_exists_error": None,
                     "cleanup_error": (
                         f"cleanup helper raised: {type(e).__name__}: {e}"
                     ),

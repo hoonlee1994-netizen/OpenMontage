@@ -2914,3 +2914,607 @@ def test_concat_ownership_v3_speed_unchanged(tmp_path: Path, dense_av: Path):
     streams = _streams_of(out)
     assert "video" in streams and "audio" in streams
     assert result.data["speed_factor"] == 2.0
+
+
+# ------------------------------------------------------------------
+# Concat ownership corrective repair v4 (F1/F2/F3):
+# regular-file segment gate, concat-local cleanup diagnostics without
+# shared side-channel state, collision-safe concat-list reservation.
+# ------------------------------------------------------------------
+
+
+def test_concat_v4_directory_segment_rejected_before_ffmpeg(tmp_path: Path, monkeypatch):
+    """v4.1 (F1): a directory segment fails before any FFmpeg execution."""
+    from tools.base_tool import ToolResult
+
+    calls: list[list[str]] = []
+    cut_calls: list[dict] = []
+
+    def spy_run(self, cmd: list[str], **kwargs):
+        calls.append(list(cmd))
+        return None
+
+    def boom_cut(self, inputs: dict):
+        cut_calls.append(dict(inputs))
+        return ToolResult(success=True, data={"operation": "cut"})
+
+    monkeypatch.setattr(VideoTrimmer, "run_command", spy_run)
+    monkeypatch.setattr(VideoTrimmer, "_cut", boom_cut)
+    subdir = tmp_path / "somedir"
+    subdir.mkdir()
+    out = tmp_path / "out.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [{"input_path": str(subdir), "start_seconds": 0, "end_seconds": 1}],
+        }
+    )
+    assert not result.success
+    assert cut_calls == [], "no trim may execute for a directory segment"
+    assert calls == [], "no FFmpeg (trim or join) may execute for a directory segment"
+    assert result.data["failed_segment_index"] == 0
+    assert result.data["segment_input"] == str(subdir)
+    assert "directory" in (result.data["segment_error"] or "").lower()
+    assert result.data["final_output_created"] is False
+    assert not out.exists()
+
+
+def test_concat_v4_directory_failure_retains_index_and_context(tmp_path: Path, monkeypatch):
+    """v4.2 (F1): middle directory segment reports its index/context; no join."""
+    calls: list[list[str]] = []
+
+    def spy_run(self, cmd: list[str], **kwargs):
+        calls.append(list(cmd))
+        return None
+
+    monkeypatch.setattr(VideoTrimmer, "run_command", spy_run)
+    a = tmp_path / "a.mp4"
+    a.write_bytes(b"fake-a")
+    subdir = tmp_path / "somedir"
+    subdir.mkdir()
+    out = tmp_path / "out.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [{"input_path": str(a)}, {"input_path": str(subdir)}],
+        }
+    )
+    assert not result.success
+    assert result.data["failed_segment_index"] == 1
+    assert result.data["segment_input"] == str(subdir)
+    assert "directory" in (result.data["segment_error"] or "").lower()
+    assert result.data["segment_file_kind"] == "directory"
+    assert result.data["final_output_created"] is False
+    assert result.data["cleanup_attempted"] is True
+    assert calls == [], "the final join must never run after a segment failure"
+    assert not out.exists()
+    assert a.is_file()
+
+
+@needs_ffmpeg
+def test_concat_v4_symlink_to_regular_file_remains_valid(tmp_path: Path, dense_av: Path):
+    """v4.3 (F1): a symlink to a valid regular file stays supported."""
+    link = tmp_path / "link.mp4"
+    link.symlink_to(dense_av)
+    out = tmp_path / "v4_symlink.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [{"input_path": str(link)}, {"input_path": str(dense_av)}],
+        }
+    )
+    assert result.success, result.error
+    assert out.is_file()
+    assert "video" in _streams_of(out)
+    assert link.is_symlink(), "the symlink itself must survive"
+    assert not (out.parent / ".concat_tmp").exists()
+
+
+def test_concat_v4_exists_stat_oserror_retains_type_and_message(tmp_path: Path, monkeypatch):
+    """v4.4 (F2): exists()/stat OSError keeps exception type/message."""
+    a = tmp_path / "a.mp4"
+    a.write_bytes(b"fake-a")
+    out = tmp_path / "out.mp4"
+
+    def boom_exists(self):
+        raise OSError("injected-stat-failure-v4")
+
+    monkeypatch.setattr(Path, "exists", boom_exists)
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [{"input_path": str(a)}],
+        }
+    )
+    assert not result.success
+    assert result.data["failed_segment_index"] == 0
+    assert result.data["segment_input"] == str(a)
+    assert result.data["segment_stat_error_type"] == "OSError"
+    assert "injected-stat-failure-v4" in (result.data["segment_stat_error_message"] or "")
+    blob = (result.error or "") + str(result.data)
+    assert "OSError" in blob
+    assert "injected-stat-failure-v4" in blob
+    assert result.data["final_output_created"] is False
+
+
+def test_concat_v4_exists_uncertainty_sets_cleanup_failure_truthfully(
+    tmp_path: Path, monkeypatch
+):
+    """v4.5 (F2): stat uncertainty never becomes a clean-success claim."""
+    a = tmp_path / "a.mp4"
+    a.write_bytes(b"fake-a")
+    out = tmp_path / "out.mp4"
+
+    def boom_exists(self):
+        raise OSError("injected-stat-uncertainty-v4")
+
+    monkeypatch.setattr(Path, "exists", boom_exists)
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [{"input_path": str(a)}],
+        }
+    )
+    assert not result.success
+    assert result.data["cleanup_attempted"] is True
+    assert result.data["cleanup_ok"] is False
+    assert result.data["cleanup_error"] is not None
+    assert "injected-stat-uncertainty-v4" in (result.data["cleanup_error"] or "")
+
+
+@needs_ffmpeg
+def test_concat_v4_foreign_list_survives_byte_for_byte(tmp_path: Path, dense_av: Path):
+    """v4.6 (F3): pre-existing .concat_tmp/concat_list.txt is never touched."""
+    out = tmp_path / "v4_foreign.mp4"
+    ctmp = out.parent / ".concat_tmp"
+    ctmp.mkdir(parents=True, exist_ok=True)
+    foreign = ctmp / "concat_list.txt"
+    sentinel = b"FOREIGN-SENTINEL-v4-do-not-touch-0123456789"
+    foreign.write_bytes(sentinel)
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [{"input_path": str(dense_av)}, {"input_path": str(dense_av)}],
+        }
+    )
+    assert result.success, result.error
+    assert out.is_file()
+    assert foreign.is_file(), "foreign list must survive the invocation"
+    assert foreign.read_bytes() == sentinel, "foreign list must survive byte-for-byte"
+
+
+@needs_ffmpeg
+def test_concat_v4_occupied_list_causes_unique_reservation(tmp_path: Path, dense_av: Path):
+    """v4.7 (F3): an occupied concat_list.txt forces a unique list path."""
+    out = tmp_path / "v4_reserve.mp4"
+    ctmp = out.parent / ".concat_tmp"
+    ctmp.mkdir(parents=True, exist_ok=True)
+    (ctmp / "concat_list.txt").write_bytes(b"FOREIGN-v4")
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [{"input_path": str(dense_av)}],
+        }
+    )
+    assert result.success, result.error
+    used = result.data["concat_list_path"]
+    assert used != str(ctmp / "concat_list.txt")
+    assert used.endswith("concat_list_c01.txt"), f"unexpected reservation: {used}"
+    assert (ctmp / "concat_list.txt").read_bytes() == b"FOREIGN-v4"
+
+
+@needs_ffmpeg
+def test_concat_v4_multiple_occupied_list_names_advance_safely(
+    tmp_path: Path, dense_av: Path
+):
+    """v4.8 (F3): several occupied list candidates advance to a free name."""
+    out = tmp_path / "v4_multi.mp4"
+    ctmp = out.parent / ".concat_tmp"
+    ctmp.mkdir(parents=True, exist_ok=True)
+    occupants = {
+        "concat_list.txt": b"FOREIGN-0-v4",
+        "concat_list_c01.txt": b"FOREIGN-1-v4",
+        "concat_list_c02.txt": b"FOREIGN-2-v4",
+    }
+    for name, payload in occupants.items():
+        (ctmp / name).write_bytes(payload)
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [{"input_path": str(dense_av)}],
+        }
+    )
+    assert result.success, result.error
+    used = result.data["concat_list_path"]
+    assert used.endswith("concat_list_c03.txt"), f"unexpected reservation: {used}"
+    for name, payload in occupants.items():
+        assert (ctmp / name).read_bytes() == payload, f"{name} mutated"
+
+
+@needs_ffmpeg
+def test_concat_v4_foreign_list_never_cleanup_owned(tmp_path: Path, dense_av: Path):
+    """v4.9 (F3): the foreign list never enters the owned cleanup collection."""
+    out = tmp_path / "v4_owned.mp4"
+    ctmp = out.parent / ".concat_tmp"
+    ctmp.mkdir(parents=True, exist_ok=True)
+    foreign = ctmp / "concat_list.txt"
+    foreign.write_bytes(b"FOREIGN-OWNERSHIP-v4")
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [{"input_path": str(dense_av)}],
+        }
+    )
+    assert result.success, result.error
+    owned = [d["path"] for d in result.data["temp_file_details"]]
+    assert str(foreign) not in owned
+    assert str(foreign) not in (result.data["cleanup_remaining_paths"] or [])
+    assert foreign.read_bytes() == b"FOREIGN-OWNERSHIP-v4"
+
+
+@needs_ffmpeg
+def test_concat_v4_invocation_list_cleaned_normally(tmp_path: Path, dense_av: Path):
+    """v4.10 (F3): the invocation-created list is cleaned on success."""
+    out = tmp_path / "v4_clean.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [{"input_path": str(dense_av)}],
+        }
+    )
+    assert result.success, result.error
+    used = Path(result.data["concat_list_path"])
+    assert used.name == "concat_list.txt"
+    assert not used.exists(), "invocation-created list must be cleaned"
+    assert not (out.parent / ".concat_tmp").exists()
+    assert result.data["cleanup_ok"] is True
+
+
+def test_concat_v4_list_write_failure_preserves_truth(tmp_path: Path, monkeypatch):
+    """v4.11 (F3): list-write failure keeps ownership/cleanup truthful."""
+    import builtins
+
+    a = tmp_path / "a.mp4"
+    a.write_bytes(b"fake-a")
+    out = tmp_path / "out.mp4"
+    calls: list[list[str]] = []
+
+    def spy_run(self, cmd: list[str], **kwargs):
+        calls.append(list(cmd))
+        return None
+
+    real_open = builtins.open
+
+    def guarded_open(file, *args, **kwargs):
+        if "concat_list" in str(file):
+            raise OSError("injected-list-write-failure-v4")
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(VideoTrimmer, "run_command", spy_run)
+    monkeypatch.setattr(builtins, "open", guarded_open)
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [{"input_path": str(a)}],
+        }
+    )
+    assert not result.success
+    assert "concat list write failed" in (result.error or "")
+    assert "injected-list-write-failure-v4" in (result.error or "")
+    assert result.data["join_exception_type"] == "OSError"
+    assert result.data["final_output_created"] is False
+    assert result.data["cleanup_attempted"] is True
+    assert result.data["concat_list_path"] is not None
+    assert calls == [], "join must not run when the list cannot be written"
+    assert not out.exists()
+    assert a.is_file()
+
+
+def test_concat_v4_no_stale_side_channel_attribution(tmp_path: Path, monkeypatch):
+    """v4.12 (F2): concat cleanup never attributes stale shared last_error."""
+    from tools.base_tool import ToolResult
+
+    import tools.video.video_trimmer as vt_mod
+
+    a = tmp_path / "a.mp4"
+    b = tmp_path / "b.mp4"
+    a.write_bytes(b"fake-a")
+    b.write_bytes(b"fake-b")
+    out = tmp_path / "out.mp4"
+
+    def fake_cut(self, inputs):
+        op = str(inputs["output_path"])
+        if "seg_0000" in op:
+            p = Path(inputs["output_path"])
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(b"good-temp")
+            return ToolResult(success=True, data={"operation": "cut"})
+        return ToolResult(
+            success=False, error="simulated primary trim failure v4", data={}
+        )
+
+    # Case 1: a non-raising double; stale sentinel must not leak in.
+    monkeypatch.setattr(VideoTrimmer, "_cut", fake_cut)
+    monkeypatch.setattr(vt_mod, "_try_remove_artifact", lambda p: (False, True))
+    vt_mod._try_remove_artifact.last_error = {
+        "error_type": "OSError",
+        "error_message": "STALE-SENTINEL-v4-must-never-surface",
+    }
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {"input_path": str(a), "start_seconds": 0, "end_seconds": 1},
+                {"input_path": str(b), "start_seconds": 0, "end_seconds": 1},
+            ],
+        }
+    )
+    assert not result.success
+    blob = (result.error or "") + str(result.data)
+    assert "STALE-SENTINEL-v4-must-never-surface" not in blob
+    assert result.data["cleanup_ok"] is False
+
+    # Case 2: production remover path with a live unlink failure; the
+    # live diagnostic wins and the stale sentinel stays absent.
+    monkeypatch.setattr(vt_mod, "_try_remove_artifact", vt_mod._UNPATCHED_TRY_REMOVE)
+
+    def boom_unlink(self, *args, **kwargs):
+        raise OSError("live-unlink-v4")
+
+    monkeypatch.setattr(Path, "unlink", boom_unlink)
+    vt_mod._try_remove_artifact.last_error = {
+        "error_type": "OSError",
+        "error_message": "STALE-SENTINEL-v4-must-never-surface",
+    }
+    out2 = tmp_path / "out2.mp4"
+    result2 = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out2),
+            "segments": [
+                {"input_path": str(a), "start_seconds": 0, "end_seconds": 1},
+                {"input_path": str(b), "start_seconds": 0, "end_seconds": 1},
+            ],
+        }
+    )
+    assert not result2.success
+    blob2 = (result2.error or "") + str(result2.data)
+    assert "STALE-SENTINEL-v4-must-never-surface" not in blob2
+    assert "live-unlink-v4" in (result2.data["cleanup_error"] or "")
+
+
+def test_concat_v4_temp_collision_advances_safely(tmp_path: Path, monkeypatch):
+    """v4.13: on-disk temp-name collision reserves a distinct owned path."""
+    from tools.base_tool import ToolResult
+
+    a = tmp_path / "a.mp4"
+    a.write_bytes(b"fake-a")
+    out = tmp_path / "out.mp4"
+    ctmp = tmp_path / ".concat_tmp"
+    ctmp.mkdir(parents=True)
+    squatter = ctmp / "seg_0000.mp4"
+    squatter.write_bytes(b"SQUATTER-BYTES-v4")
+    cut_outputs: list[str] = []
+
+    def ok_cut(self, inputs):
+        cut_outputs.append(str(inputs["output_path"]))
+        p = Path(inputs["output_path"])
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"good-temp")
+        return ToolResult(success=True, data={"operation": "cut"})
+
+    monkeypatch.setattr(VideoTrimmer, "_cut", ok_cut)
+    monkeypatch.setattr(VideoTrimmer, "run_command", lambda self, cmd, **kw: None)
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [{"input_path": str(a), "start_seconds": 0, "end_seconds": 1}],
+        }
+    )
+    assert result.success, result.error
+    assert len(cut_outputs) == 1
+    assert cut_outputs[0] != str(squatter)
+    assert "seg_0000" in cut_outputs[0]
+    assert squatter.is_file()
+    assert squatter.read_bytes() == b"SQUATTER-BYTES-v4"
+
+
+def test_concat_v4_malformed_middle_cleanup_correct(tmp_path: Path, monkeypatch):
+    """v4.14: malformed middle segment cleans owned temps, keeps context."""
+    from tools.base_tool import ToolResult
+
+    a = tmp_path / "a.mp4"
+    a.write_bytes(b"fake-a")
+    out = tmp_path / "out.mp4"
+
+    def fake_cut(self, inputs):
+        p = Path(inputs["output_path"])
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"good-temp")
+        return ToolResult(success=True, data={"operation": "cut"})
+
+    monkeypatch.setattr(VideoTrimmer, "_cut", fake_cut)
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {"input_path": str(a), "start_seconds": 0, "end_seconds": 1},
+                {"not": "a-segment"},
+            ],
+        }
+    )
+    assert not result.success
+    assert result.data["failed_segment_index"] == 1
+    assert result.data["malformed_segment"] is True
+    assert result.data["final_output_created"] is False
+    assert list(tmp_path.rglob("seg_*.mp4")) == []
+    assert not (tmp_path / ".concat_tmp").exists()
+    assert a.is_file()
+
+
+def test_concat_v4_preexisting_output_left_in_place(tmp_path: Path, monkeypatch):
+    """v4.15 (O4): pre-existing final output survives a failed join."""
+    from tools.base_tool import ToolResult
+    from tools.base_tool import ToolCommandError
+
+    a = tmp_path / "a.mp4"
+    a.write_bytes(b"fake-a")
+    out = tmp_path / "out.mp4"
+    out.write_bytes(b"PREEXISTING-OUTPUT-v4")
+
+    def fake_cut(self, inputs):
+        p = Path(inputs["output_path"])
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"good-temp")
+        return ToolResult(success=True, data={"operation": "cut"})
+
+    def boom_join(self, cmd: list[str], **kwargs):
+        raise ToolCommandError(1, cmd, detail="simulated join failure v4")
+
+    monkeypatch.setattr(VideoTrimmer, "_cut", fake_cut)
+    monkeypatch.setattr(VideoTrimmer, "run_command", boom_join)
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [{"input_path": str(a)}],
+        }
+    )
+    assert not result.success
+    assert "concat join failed" in (result.error or "")
+    assert result.data["final_output_created"] is False
+    assert result.data["output_existed_before"] is True
+    assert result.data["output_created_by_invocation"] is False
+    assert result.data["partial_output_removed"] is None
+    assert out.is_file()
+    assert a.is_file()
+
+
+@needs_ffmpeg
+def test_concat_v4_aligned_trimmed_concat_unchanged(tmp_path: Path, dense_av: Path):
+    """v4.16: aligned trimmed concat succeeds with verified media."""
+    out = tmp_path / "v4_aligned.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {"input_path": str(dense_av), "start_seconds": 0, "end_seconds": 3},
+                {"input_path": str(dense_av)},
+            ],
+        }
+    )
+    assert result.success, result.error
+    assert out.is_file()
+    streams = _streams_of(out)
+    assert "video" in streams and "audio" in streams
+    assert result.data["cleanup_ok"] is True
+    assert not (out.parent / ".concat_tmp").exists()
+
+
+@needs_ffmpeg
+def test_concat_v4_sparse_copy_rejection_unchanged(
+    tmp_path: Path, sparse_av: Path, dense_av: Path
+):
+    """v4.17: sparse non-keyframe copy trim still fails closed, no join artifact."""
+    out = tmp_path / "v4_sparse.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {"input_path": str(sparse_av), "start_seconds": 1.7, "end_seconds": 4.3},
+                {"input_path": str(dense_av)},
+            ],
+        }
+    )
+    assert not result.success
+    err = (result.error or "").lower()
+    assert "re-encode" in err and "libx264" in err
+    assert result.data["failed_segment_index"] == 0
+    assert result.data["final_output_created"] is False
+    assert not out.exists()
+    assert sparse_av.is_file() and dense_av.is_file()
+
+
+@needs_ffmpeg
+def test_concat_v4_explicit_libx264_unchanged(
+    tmp_path: Path, sparse_av: Path, dense_av: Path
+):
+    """v4.18: explicit codec='libx264' still yields frame-accurate success."""
+    out = tmp_path / "v4_libx264.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "codec": "libx264",
+            "segments": [
+                {"input_path": str(sparse_av), "start_seconds": 1.7, "end_seconds": 4.3},
+                {"input_path": str(dense_av), "start_seconds": 0, "end_seconds": 2},
+            ],
+        }
+    )
+    assert result.success, result.error
+    assert out.is_file()
+    assert "video" in _streams_of(out)
+    assert not (out.parent / ".concat_tmp").exists()
+
+
+def test_concat_v4_cut_interval_contract_unchanged(tmp_path: Path, dense_av: Path, monkeypatch):
+    """v4.19: _cut() interval validation still rejects before FFmpeg."""
+    def _must_not_run(self, cmd: list[str], **kwargs):
+        raise AssertionError("FFmpeg must not run for an invalid interval")
+
+    monkeypatch.setattr(VideoTrimmer, "run_command", _must_not_run)
+    out = tmp_path / "v4_cut_bad.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "cut",
+            "input_path": str(dense_av),
+            "output_path": str(out),
+            "start_seconds": 4.0,
+            "end_seconds": 2.0,
+            "codec": "copy",
+        }
+    )
+    assert not result.success
+    assert "end_seconds" in (result.error or "")
+    assert not out.exists(), "invalid interval must not create an artifact"
+
+
+def test_concat_v4_speed_contract_unchanged(tmp_path: Path, dense_av: Path, monkeypatch):
+    """v4.20: _speed() contract unchanged (factor echo, output record)."""
+    seen: list[list[str]] = []
+
+    def fake_run(self, cmd: list[str], **kwargs):
+        seen.append(list(cmd))
+        return None
+
+    monkeypatch.setattr(VideoTrimmer, "run_command", fake_run)
+    out = tmp_path / "v4_speed.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "speed",
+            "input_path": str(dense_av),
+            "output_path": str(out),
+            "speed_factor": 2.0,
+        }
+    )
+    assert result.success, result.error
+    assert result.data["speed_factor"] == 2.0
+    assert result.data["output"] == str(out)
+    assert len(seen) == 1

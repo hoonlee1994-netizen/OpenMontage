@@ -8,7 +8,9 @@ by default.
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import stat
 import subprocess
 import time
 from pathlib import Path
@@ -259,6 +261,257 @@ def _try_remove_artifact(path: Path) -> tuple[bool, bool]:
 
 
 _try_remove_artifact.last_error = None  # type: ignore[attr-defined]
+
+
+# Reference to the original remover, captured at import time. Concat
+# cleanup consults the module-global ``_try_remove_artifact`` symbol
+# dynamically so test doubles installed there are honored; identity
+# against this reference tells the concat-local helper whether the
+# production remover (direct removal, full diagnostics) or a double
+# (honor its report, verify directly) is in effect. Neither path reads
+# or writes ``last_error``.
+_UNPATCHED_TRY_REMOVE = _try_remove_artifact
+
+
+def _classify_segment_input(path: Path) -> tuple[str, Optional[dict[str, str]]]:
+    """Filesystem gate for concat segment inputs (F1 corrective repair v4).
+
+    A segment input must resolve to a usable regular file. Symlinks are
+    followed, so a symlink to a valid regular file stays supported while
+    a symlink to a directory (or a dangling symlink) is rejected. Never
+    raises: filesystem uncertainty is reported as data, never swallowed.
+
+    Returns (kind, diag) with kind in:
+      "regular_file" – usable; diag is None.
+      "missing"      – path (or a path component) does not exist.
+      "directory"    – resolves to a directory.
+      "nonregular"   – resolves to a non-file object (fifo/socket/device).
+      "stat_error"   – existence/type could not be established (OSError).
+    diag carries operation/path/error_type/error_message when present.
+    """
+    exists_diag: Optional[dict[str, str]] = None
+    try:
+        exists_ok = path.exists()
+    except Exception as e:
+        exists_ok = False
+        exists_diag = {
+            "operation": "exists",
+            "path": str(path),
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+        }
+    try:
+        st = path.stat()  # follows symlinks
+    except FileNotFoundError as e:
+        return "missing", exists_diag or {
+            "operation": "stat",
+            "path": str(path),
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+        }
+    except NotADirectoryError as e:
+        return "missing", exists_diag or {
+            "operation": "stat",
+            "path": str(path),
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+        }
+    except OSError as e:
+        return "stat_error", exists_diag or {
+            "operation": "stat",
+            "path": str(path),
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+        }
+    except Exception as e:
+        return "stat_error", exists_diag or {
+            "operation": "stat",
+            "path": str(path),
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+        }
+    if exists_diag is not None:
+        # stat() succeeded but exists() raised: contradictory signals.
+        # Fail closed rather than trusting either probe.
+        return "stat_error", exists_diag
+    try:
+        mode = st.st_mode
+    except Exception as e:
+        return "stat_error", {
+            "operation": "stat",
+            "path": str(path),
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+        }
+    if stat.S_ISREG(mode):
+        return "regular_file", None
+    if stat.S_ISDIR(mode):
+        return "directory", None
+    return "nonregular", {
+        "operation": "stat",
+        "path": str(path),
+        "error_type": "NonRegularFile",
+        "error_message": f"not a usable regular file (mode {oct(mode)})",
+    }
+
+
+def _concat_exists_probe(path: Path) -> tuple[Optional[bool], Optional[dict[str, str]]]:
+    """Direct existence probe for concat cleanup verification (F2 v4).
+
+    Returns (still_exists, diag): still_exists is None with diag set on
+    stat uncertainty. Never raises; never touches shared side-channel
+    state. ``Path.exists()`` is used so the same seam also observes
+    ``os.stat``-level failures, which propagate through it.
+    """
+    try:
+        return bool(path.exists()), None
+    except Exception as e:
+        return None, {
+            "operation": "exists",
+            "path": str(path),
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+        }
+
+
+def _concat_remove_artifact(path: Path) -> tuple[dict[str, Any], list[str]]:
+    """Concat-local diagnostic removal (F2 corrective repair v4).
+
+    Returns (detail, problems). Never raises. Never reads or writes
+    ``_try_remove_artifact.last_error``: diagnostics come only from live
+    exception objects and direct verification probes, so stale shared
+    state can never be misattributed to this invocation's cleanup.
+
+    Two branches under one ownership contract:
+    - Production (module-global remover is the original): unlink and
+      verify directly via ``Path`` methods, capturing every OSError
+      with its operation/path/type/message.
+    - Patched seam (a test double is installed at the module-global
+      ``_try_remove_artifact`` symbol): the double is honored. Raised
+      errors are captured directly from the live exception object;
+      tuple reports are honored and then verified with a direct
+      existence probe (stat uncertainty captured too).
+    """
+    detail: dict[str, Any] = {
+        "path": str(path),
+        "operation": "unlink",
+        "removed": False,
+        "exists_after": True,
+        "existence_unknown": False,
+        "error_type": None,
+        "error_message": None,
+        "cleanup_error": None,
+    }
+    problems: list[str] = []
+
+    def _record_live_unlink_error(exc: BaseException) -> None:
+        etype = type(exc).__name__
+        emsg = str(exc)
+        detail["error_type"] = etype
+        detail["error_message"] = emsg
+        detail["cleanup_error"] = f"{etype}: {emsg}"
+        problems.append(f"{path}: unlink failed: {etype}: {emsg}")
+
+    def _verify_post_state(unlink_failed: bool) -> None:
+        """Direct post-state verification with stat-error capture."""
+        still, sdiag = _concat_exists_probe(path)
+        if sdiag is not None:
+            detail["existence_unknown"] = True
+            detail["exists_after"] = True
+            detail["removed"] = False
+            detail["exists_error_type"] = sdiag["error_type"]
+            detail["exists_error_message"] = sdiag["error_message"]
+            problems.append(
+                f"{path}: exists/stat failed: "
+                f"{sdiag['error_type']}: {sdiag['error_message']}"
+            )
+            return
+        assert still is not None
+        detail["exists_after"] = bool(still)
+        detail["removed"] = not bool(still)
+        if unlink_failed and not still:
+            # Absence is proven despite the unlink error (concurrent
+            # remover); the unlink diagnostic above is retained.
+            pass
+        elif still:
+            if not unlink_failed:
+                problems.append(
+                    f"{path}: unlink reported success but the path "
+                    "still exists"
+                )
+
+    try:
+        remover = _try_remove_artifact
+    except Exception:
+        remover = _UNPATCHED_TRY_REMOVE  # type: ignore[assignment]
+
+    if remover is _UNPATCHED_TRY_REMOVE:
+        # Production: direct removal with full live diagnostics.
+        live_error: Optional[BaseException] = None
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            live_error = e
+        if live_error is not None:
+            _record_live_unlink_error(live_error)
+            _verify_post_state(unlink_failed=True)
+        else:
+            _verify_post_state(unlink_failed=False)
+        return detail, problems
+
+    # Patched seam: honor the test double without shared state.
+    try:
+        outcome = remover(path)
+    except Exception as e:
+        _record_live_unlink_error(e)
+        _verify_post_state(unlink_failed=True)
+        return detail, problems
+    try:
+        reported_removed = bool(outcome[0])
+        reported_exists_after = bool(outcome[1])
+    except Exception as e:
+        etype = type(e).__name__
+        emsg = str(e)
+        detail["error_type"] = etype
+        detail["error_message"] = emsg
+        detail["cleanup_error"] = f"{etype}: {emsg}"
+        problems.append(
+            f"{path}: cleanup remover returned an unusable result: "
+            f"{etype}: {emsg}"
+        )
+        _verify_post_state(unlink_failed=True)
+        return detail, problems
+    if (not reported_removed) or reported_exists_after:
+        # The seam reports failure but raised nothing: no live unlink
+        # exception exists to attribute, so verify the post-state
+        # directly and report the seam's verdict truthfully.
+        still, sdiag = _concat_exists_probe(path)
+        if sdiag is not None:
+            detail["existence_unknown"] = True
+            detail["exists_after"] = True
+            detail["removed"] = False
+            detail["exists_error_type"] = sdiag["error_type"]
+            detail["exists_error_message"] = sdiag["error_message"]
+            problems.append(
+                f"{path}: unlink reported removed={reported_removed} "
+                f"exists_after={reported_exists_after}; verification "
+                f"stat failed: {sdiag['error_type']}: "
+                f"{sdiag['error_message']}"
+            )
+        else:
+            assert still is not None
+            detail["exists_after"] = bool(still)
+            detail["removed"] = reported_removed and not bool(still)
+            problems.append(
+                f"{path}: unlink reported removed={reported_removed} "
+                f"exists_after={reported_exists_after}"
+            )
+    else:
+        detail["removed"] = True
+        detail["exists_after"] = False
+    return detail, problems
 
 
 def _canon_path(p: Any) -> str:
@@ -1011,10 +1264,19 @@ class VideoTrimmer(BaseTool):
         # O4: snapshot the pre-existing final output before touching
         # anything. Only an invocation-created partial may be a removal
         # candidate; a pre-existing user file is never deleted here.
+        # Snapshot uncertainty is conservative (assume pre-existing) and
+        # its diagnostic is preserved for join-failure reporting (F2 v4).
+        output_snapshot_diag: Optional[dict[str, str]] = None
         try:
             output_existed_before = output_path.exists()
-        except Exception:
+        except Exception as e:
             output_existed_before = True  # conservative: never delete on doubt
+            output_snapshot_diag = {
+                "operation": "exists",
+                "path": str(output_path),
+                "error_type": type(e).__name__,
+                "error_message": str(e),
+            }
 
         def _is_original(cand: Path) -> bool:
             try:
@@ -1115,10 +1377,10 @@ class VideoTrimmer(BaseTool):
                                 continue  # not ours; never delete
                         except Exception:
                             continue  # cannot prove ownership; never delete
-                        _reset_remove_error()
                         try:
-                            removed, exists_after = _try_remove_artifact(tf)
+                            file_detail, file_problems = _concat_remove_artifact(tf)
                         except Exception as e:
+                            # The helper is non-raising; defense in depth.
                             try:
                                 file_details.append(
                                     {
@@ -1126,6 +1388,7 @@ class VideoTrimmer(BaseTool):
                                         "operation": "unlink",
                                         "removed": False,
                                         "exists_after": True,
+                                        "existence_unknown": True,
                                         "error_type": type(e).__name__,
                                         "error_message": str(e),
                                         "cleanup_error": f"{type(e).__name__}: {e}",
@@ -1139,35 +1402,8 @@ class VideoTrimmer(BaseTool):
                             )
                             continue
                         try:
-                            detail: dict[str, Any] = {
-                                "path": str(tf),
-                                "operation": "unlink",
-                                "removed": bool(removed),
-                                "exists_after": bool(exists_after),
-                            }
-                            if (not removed) or exists_after:
-                                diag = _last_remove_error()
-                                if diag is not None:
-                                    detail["error_type"] = diag["error_type"]
-                                    detail["error_message"] = diag[
-                                        "error_message"
-                                    ]
-                                    detail["cleanup_error"] = (
-                                        f"{diag['error_type']}: "
-                                        f"{diag['error_message']}"
-                                    )
-                                    problems.append(
-                                        f"{tf}: unlink failed: "
-                                        f"{diag['error_type']}: "
-                                        f"{diag['error_message']}"
-                                    )
-                                else:
-                                    problems.append(
-                                        f"{tf}: unlink reported "
-                                        f"removed={removed} "
-                                        f"exists_after={exists_after}"
-                                    )
-                            file_details.append(detail)
+                            file_details.append(file_detail)
+                            problems.extend(file_problems)
                         except Exception:
                             pass
                     except Exception as e:
@@ -1195,32 +1431,35 @@ class VideoTrimmer(BaseTool):
                 # touched (O1).
                 if list_created_by_us and list_path_used is not None:
                     try:
-                        _reset_remove_error()
                         try:
-                            list_removed, list_exists_after = _try_remove_artifact(
+                            list_detail, list_problems = _concat_remove_artifact(
                                 list_path_used
                             )
                         except Exception as e:
+                            # The helper is non-raising; defense in depth.
                             list_removed, list_exists_after = False, True
                             problems.append(
                                 f"{list_path_used}: unlink raised "
                                 f"{type(e).__name__}: {e}"
                             )
                         else:
-                            if (not list_removed) or list_exists_after:
-                                diag = _last_remove_error()
-                                if diag is not None:
-                                    problems.append(
-                                        f"{list_path_used}: unlink failed: "
-                                        f"{diag['error_type']}: "
-                                        f"{diag['error_message']}"
-                                    )
-                                else:
-                                    problems.append(
-                                        f"{list_path_used}: unlink reported "
-                                        f"removed={list_removed} "
-                                        f"exists_after={list_exists_after}"
-                                    )
+                            try:
+                                list_removed = bool(
+                                    list_detail.get("removed", False)
+                                )
+                                list_exists_after = bool(
+                                    list_detail.get("exists_after", True)
+                                )
+                                if list_detail.get("existence_unknown"):
+                                    list_exists_after = True
+                                problems.extend(list_problems)
+                            except Exception as e:
+                                list_removed, list_exists_after = False, True
+                                problems.append(
+                                    f"{list_path_used}: list-removal "
+                                    f"accounting failed: "
+                                    f"{type(e).__name__}: {e}"
+                                )
                     except Exception as e:
                         problems.append(
                             f"concat_list cleanup failed: "
@@ -1238,24 +1477,66 @@ class VideoTrimmer(BaseTool):
                             f"{temp_dir}: rmdir failed: "
                             f"{type(e).__name__}: {e}"
                         )
+                        try:
+                            file_details.append(
+                                {
+                                    "path": str(temp_dir),
+                                    "operation": "rmdir",
+                                    "removed": False,
+                                    "exists_after": True,
+                                    "existence_unknown": False,
+                                    "error_type": type(e).__name__,
+                                    "error_message": str(e),
+                                    "cleanup_error": (
+                                        f"{type(e).__name__}: {e}"
+                                    ),
+                                }
+                            )
+                        except Exception:
+                            pass
                     except Exception as e:
                         problems.append(
                             f"{temp_dir}: rmdir failed: "
                             f"{type(e).__name__}: {e}"
                         )
+                        try:
+                            file_details.append(
+                                {
+                                    "path": str(temp_dir),
+                                    "operation": "rmdir",
+                                    "removed": False,
+                                    "exists_after": True,
+                                    "existence_unknown": False,
+                                    "error_type": type(e).__name__,
+                                    "error_message": str(e),
+                                    "cleanup_error": (
+                                        f"{type(e).__name__}: {e}"
+                                    ),
+                                }
+                            )
+                        except Exception:
+                            pass
                 except Exception as e:
                     problems.append(
                         f"temp_dir removal failed: {type(e).__name__}: {e}"
                     )
                 try:
                     temp_dir_exists_after = temp_dir.exists()
-                except Exception:
+                except Exception as e:
+                    # Existence uncertainty: conservatively report present
+                    # and preserve the filesystem diagnostic (F2 v4).
                     temp_dir_exists_after = True
+                    problems.append(
+                        f"{temp_dir}: exists/stat failed: "
+                        f"{type(e).__name__}: {e}"
+                    )
                 try:
                     remaining: list[str] = [
                         d["path"]
                         for d in file_details
-                        if isinstance(d, dict) and d.get("exists_after")
+                        if isinstance(d, dict)
+                        and d.get("exists_after")
+                        and d.get("operation") != "rmdir"
                     ]
                     if list_exists_after and list_path_used is not None:
                         try:
@@ -1410,28 +1691,77 @@ class VideoTrimmer(BaseTool):
                 original_keys.add(_canon_path(seg_input))
             except Exception:
                 pass
-            try:
-                seg_exists = seg_input.exists()
-            except Exception:
-                seg_exists = False
-            if not seg_exists:
+            # F1 (v4) regular-file gate: a segment input must resolve to
+            # a usable regular file (symlink -> regular file stays
+            # valid). Directories, missing paths, non-regular objects,
+            # and stat uncertainty all fail here, before FFmpeg, with
+            # structured segment-scoped context (failed_segment_index,
+            # segment_input, segment_error, final_output_created=False
+            # plus cleanup state). No join runs afterwards.
+            file_kind, file_diag = _classify_segment_input(seg_input)
+            if file_kind != "regular_file":
                 cleanup = _safe_cleanup()
-                return ToolResult(
-                    success=False,
-                    error=(
+                seg_total = len(segments)
+                if file_kind == "directory":
+                    segment_error = (
+                        f"concat segment {i} input is a directory, not a "
+                        f"usable regular file: {seg_input}; concat aborted "
+                        f"before final join ({seg_total} segments "
+                        "requested). No FFmpeg operation was executed for "
+                        "this segment and no final artifact was created."
+                    )
+                elif file_kind == "nonregular":
+                    segment_error = (
+                        f"concat segment {i} input is not a usable regular "
+                        f"file ({(file_diag or {}).get('error_message', 'non-regular object')}): "
+                        f"{seg_input}; concat aborted before final join "
+                        f"({seg_total} segments requested). No FFmpeg "
+                        "operation was executed for this segment and no "
+                        "final artifact was created."
+                    )
+                elif file_kind == "stat_error":
+                    stat_text = (
+                        f"{(file_diag or {}).get('error_type', 'OSError')}: "
+                        f"{(file_diag or {}).get('error_message', 'unknown stat error')}"
+                    )
+                    segment_error = (
+                        f"concat segment {i} input filesystem state is "
+                        f"uncertain ({stat_text}); failing closed before "
+                        f"FFmpeg for {seg_input}; concat aborted before "
+                        f"final join ({seg_total} segments requested). "
+                        "No final artifact was created."
+                    )
+                else:  # "missing"
+                    segment_error = (
                         f"concat segment {i} input not found: {seg_input}; "
                         f"concat aborted before final join "
-                        f"({len(segments)} segments requested). "
+                        f"({seg_total} segments requested). "
                         "No final artifact was created."
-                    ),
-                    data={
-                        "operation": "concat",
-                        "segment_count": len(segments),
-                        "failed_segment_index": i,
-                        "segment_input": str(seg_input),
-                        "final_output_created": False,
-                        **cleanup,
-                    },
+                    )
+                seg_fail_data: dict[str, Any] = {
+                    "operation": "concat",
+                    "segment_count": seg_total,
+                    "failed_segment_index": i,
+                    "segment_input": str(seg_input),
+                    "segment_error": segment_error,
+                    "segment_file_kind": file_kind,
+                    "final_output_created": False,
+                    **cleanup,
+                }
+                if file_diag is not None:
+                    seg_fail_data["segment_stat_operation"] = file_diag.get(
+                        "operation"
+                    )
+                    seg_fail_data["segment_stat_error_type"] = file_diag.get(
+                        "error_type"
+                    )
+                    seg_fail_data["segment_stat_error_message"] = file_diag.get(
+                        "error_message"
+                    )
+                return ToolResult(
+                    success=False,
+                    error=segment_error,
+                    data=seg_fail_data,
                 )
 
             seg_start = seg.get("start_seconds")
@@ -1544,12 +1874,44 @@ class VideoTrimmer(BaseTool):
                     )
                 try:
                     trim_output_exists = temp_path.exists()
-                except Exception:
+                    trim_output_stat_diag: Optional[dict[str, str]] = None
+                except Exception as e:
+                    # Existence uncertainty: do not let an unproven entry
+                    # reach the concat list; preserve the diagnostic (F2).
                     trim_output_exists = False
+                    trim_output_stat_diag = {
+                        "operation": "exists",
+                        "path": str(temp_path),
+                        "error_type": type(e).__name__,
+                        "error_message": str(e),
+                    }
                 if not trim_output_exists:
-                    # Defensive: _cut claimed success but left no file; do
-                    # not let a missing entry reach the concat list.
+                    # Defensive: _cut claimed success but left no file (or
+                    # the post-state cannot be proven); do not let a
+                    # missing entry reach the concat list.
                     cleanup = _safe_cleanup()
+                    missing_trim_data: dict[str, Any] = {
+                        "operation": "concat",
+                        "segment_count": len(segments),
+                        "failed_segment_index": i,
+                        "segment_input": str(seg_input),
+                        "segment_start_seconds": seg_start,
+                        "segment_end_seconds": seg_end,
+                        "codec": codec,
+                        "trim_error": None,
+                        "trim_data": trim_result.data,
+                        "trim_output_exists": False,
+                        "final_output_created": False,
+                        **cleanup,
+                    }
+                    if trim_output_stat_diag is not None:
+                        missing_trim_data["trim_output_existence_unknown"] = True
+                        missing_trim_data["trim_output_stat_error_type"] = (
+                            trim_output_stat_diag["error_type"]
+                        )
+                        missing_trim_data["trim_output_stat_error_message"] = (
+                            trim_output_stat_diag["error_message"]
+                        )
                     return ToolResult(
                         success=False,
                         error=(
@@ -1578,23 +1940,58 @@ class VideoTrimmer(BaseTool):
                 concat_inputs.append(seg_input)
 
         # Write concat file list (temp-owned; failure still cleans temps and
-        # preserves the primary list-write error). The list location is
-        # collision-safe: a pre-existing original input at the default list
-        # path is never overwritten — an alternative name is chosen — and
-        # only the path actually created here is cleanup-owned (O1). The
-        # temp dir itself is created lazily here when no trimmed segment
-        # required it earlier.
-        try:
+        # preserves the primary list-write error). Collision-safe
+        # reservation (F3 v4): the fixed "concat_list.txt" name is only
+        # the first candidate — existence is inspected BEFORE ownership
+        # registration, and an occupied name advances to
+        # "concat_list_cNN.txt", mirroring segment temp reservation. Only
+        # the newly reserved path becomes cleanup-owned; a pre-existing
+        # foreign/original list file is never overwritten or deleted
+        # (O1). The temp dir itself is created lazily here when no
+        # trimmed segment required it earlier.
+        def _reserve_list_path() -> Path:
             _ensure_temp_dir()
+            counter = 0
+            while True:
+                if counter == 0:
+                    candidate = temp_dir / "concat_list.txt"
+                else:
+                    candidate = temp_dir / f"concat_list_c{counter:02d}.txt"
+                try:
+                    on_disk = candidate.exists()
+                except Exception:
+                    # Unknown state counts as collision: never overwrite
+                    # a path whose prior state cannot be proven absent.
+                    on_disk = True
+                try:
+                    collides_output = _canon_path(candidate) == _canon_path(
+                        output_path
+                    )
+                except Exception:
+                    collides_output = True
+                if (
+                    (not on_disk)
+                    and (not _is_original(candidate))
+                    and (not collides_output)
+                ):
+                    return candidate
+                counter += 1
+                if counter > 999:
+                    raise RuntimeError(
+                        "cannot reserve collision-safe concat list path"
+                    )
+
+        try:
+            list_path_used = _reserve_list_path()
         except Exception as e:
             cleanup = _safe_cleanup()
             exc_text = f"{type(e).__name__}: {e}"
             return ToolResult(
                 success=False,
                 error=(
-                    f"concat list write failed: {exc_text}; concat aborted "
-                    f"before final join ({len(segments)} segments requested). "
-                    "No final artifact was created."
+                    f"concat list reservation failed: {exc_text}; concat "
+                    f"aborted before final join ({len(segments)} segments "
+                    "requested). No final artifact was created."
                 ),
                 data={
                     "operation": "concat",
@@ -1606,32 +2003,6 @@ class VideoTrimmer(BaseTool):
                     **cleanup,
                 },
             )
-        list_candidate = temp_dir / "concat_list.txt"
-        list_counter = 0
-        while _is_original(list_candidate):
-            list_counter += 1
-            if list_counter > 999:
-                cleanup = _safe_cleanup()
-                return ToolResult(
-                    success=False,
-                    error=(
-                        "concat list write failed: cannot choose a "
-                        "collision-safe list path; concat aborted before "
-                        f"final join ({len(segments)} segments requested). "
-                        "No final artifact was created."
-                    ),
-                    data={
-                        "operation": "concat",
-                        "segment_count": len(segments),
-                        "output": str(output_path),
-                        "join_error": "collision-safe list path unavailable",
-                        "join_exception_type": "RuntimeError",
-                        "final_output_created": False,
-                        **cleanup,
-                    },
-                )
-            list_candidate = temp_dir / f"concat_list_c{list_counter:02d}.txt"
-        list_path_used = list_candidate
         list_created_by_us = True
         try:
             with open(list_path_used, "w", encoding="utf-8") as f:
@@ -1653,6 +2024,7 @@ class VideoTrimmer(BaseTool):
                     "operation": "concat",
                     "segment_count": len(segments),
                     "output": str(output_path),
+                    "concat_list_path": str(list_path_used),
                     "join_error": exc_text,
                     "join_exception_type": type(e).__name__,
                     "final_output_created": False,
@@ -1678,33 +2050,77 @@ class VideoTrimmer(BaseTool):
             # explicitly instead.
             try:
                 output_exists_after_join = output_path.exists()
-            except Exception:
+                output_exists_diag: Optional[dict[str, str]] = None
+            except Exception as e_join_exists:
+                # Uncertainty: assume a partial may exist (it can only be
+                # removed when proven invocation-created) and preserve the
+                # diagnostic (F2 v4).
                 output_exists_after_join = True
+                output_exists_diag = {
+                    "operation": "exists",
+                    "path": str(output_path),
+                    "error_type": type(e_join_exists).__name__,
+                    "error_message": str(e_join_exists),
+                }
             created_by_us = (
                 (not output_existed_before) and output_exists_after_join
             )
             partial_data: dict[str, Any] = {
                 "output_existed_before": output_existed_before,
                 "output_created_by_invocation": created_by_us,
+                "concat_list_path": str(list_path_used),
             }
+            if output_snapshot_diag is not None:
+                partial_data["output_snapshot_error_type"] = (
+                    output_snapshot_diag["error_type"]
+                )
+                partial_data["output_snapshot_error_message"] = (
+                    output_snapshot_diag["error_message"]
+                )
+            if output_exists_diag is not None:
+                partial_data["output_exists_error_type"] = (
+                    output_exists_diag["error_type"]
+                )
+                partial_data["output_exists_error_message"] = (
+                    output_exists_diag["error_message"]
+                )
             partial_removal_text: Optional[str] = None
+            partial_extra_problems: list[str] = []
             if created_by_us:
                 try:
-                    _reset_remove_error()
-                    p_removed, p_exists_after = _try_remove_artifact(
+                    p_detail, p_problems = _concat_remove_artifact(
                         output_path
                     )
-                    p_diag = (
-                        _last_remove_error()
-                        if ((not p_removed) or p_exists_after)
-                        else None
-                    )
+                    partial_extra_problems.extend(p_problems)
                 except Exception as e2:
+                    # The helper is non-raising; defense in depth.
                     p_removed, p_exists_after = False, True
                     p_diag = {
                         "error_type": type(e2).__name__,
                         "error_message": str(e2),
                     }
+                    partial_extra_problems.append(
+                        f"{output_path}: partial removal raised "
+                        f"{type(e2).__name__}: {e2}"
+                    )
+                else:
+                    p_removed = bool(p_detail.get("removed", False))
+                    p_exists_after = bool(
+                        p_detail.get("exists_after", True)
+                    )
+                    if p_detail.get("existence_unknown"):
+                        p_exists_after = True
+                    if p_detail.get("error_type") is not None:
+                        p_diag = {
+                            "error_type": str(
+                                p_detail.get("error_type")
+                            ),
+                            "error_message": str(
+                                p_detail.get("error_message", "")
+                            ),
+                        }
+                    else:
+                        p_diag = None
                 partial_data["partial_output_removed"] = bool(p_removed)
                 partial_data["partial_output_exists_after"] = bool(
                     p_exists_after
@@ -1754,12 +2170,22 @@ class VideoTrimmer(BaseTool):
                         rem_paths.append(str(output_path))
                     cleanup["cleanup_remaining_paths"] = rem_paths
                     cleanup["cleanup_ok"] = False
-                    if partial_removal_text is not None:
+                    merge_bits: list[str] = []
+                    try:
                         prev_err = cleanup.get("cleanup_error")
-                        cleanup["cleanup_error"] = (
-                            (prev_err + "; " if prev_err else "")
-                            + partial_removal_text
-                        )
+                    except Exception:
+                        prev_err = None
+                    if prev_err:
+                        merge_bits.append(str(prev_err))
+                    merge_bits.extend(partial_extra_problems)
+                    if partial_removal_text is not None:
+                        merge_bits.append(partial_removal_text)
+                    try:
+                        cleanup["cleanup_error"] = "; ".join(
+                            b for b in merge_bits if b
+                        ) or None
+                    except Exception:
+                        pass
                 except Exception:
                     try:
                         cleanup["cleanup_ok"] = False
@@ -1789,6 +2215,7 @@ class VideoTrimmer(BaseTool):
                 "operation": "concat",
                 "segment_count": len(segments),
                 "output": str(output_path),
+                "concat_list_path": str(list_path_used),
                 **cleanup,
             },
             artifacts=[str(output_path)],

@@ -1343,3 +1343,142 @@ def test_composition_validator_hyperframes_asset_root(tmp_path: Path):
     assert result.success, result.error
     info_lines = " ".join(result.data.get("info", []))
     assert "hyperframes" in info_lines.lower() or "assets" in info_lines.lower()
+
+
+# ------------------------------------------------------------------
+# B3: slow npm registry must not fake-unavailable a working runtime
+# ------------------------------------------------------------------
+
+import shutil as _shutil_b3
+
+
+def _local_floor_met() -> bool:
+    t = HyperFramesCompose()
+    return (
+        t._node_major_version() is not None
+        and t._node_major_version() >= HyperFramesCompose._NODE_FLOOR_MAJOR
+        and _shutil_b3.which("ffmpeg") is not None
+        and _shutil_b3.which("npx") is not None
+    )
+
+
+def test_npm_soft_timeout_does_not_gate_working_runtime(monkeypatch):
+    """CLI doctor success + slow `npm view` (timeout) must be AVAILABLE.
+
+    Regression for the ARM64 false negative: `npm view` needs ~6-8s on
+    a slow registry while the availability gate allowed only 5s, so a
+    healthy runtime reported UNAVAILABLE without ever probing the CLI.
+    """
+    import shutil
+
+    monkeypatch.setattr(
+        HyperFramesCompose, "_npm_resolve_cache", None, raising=False
+    )
+    monkeypatch.setattr(
+        HyperFramesCompose, "_cli_probe_cache", None, raising=False
+    )
+    monkeypatch.setattr(
+        HyperFramesCompose,
+        "_resolve_npm_package",
+        classmethod(
+            lambda cls: {"error": "timeout (5s) -- offline or slow registry"}
+        ),
+    )
+    monkeypatch.setattr(
+        HyperFramesCompose,
+        "_probe_cli",
+        classmethod(lambda cls: {"status": "ok"}),
+    )
+    rc = HyperFramesCompose()._runtime_check()
+    if not _local_floor_met():
+        pytest.skip("Local runtime floor not met on this machine")
+    assert rc["runtime_available"] is True
+    assert rc["reasons"] == []
+    # The slow lookup stays visible as a diagnostic, not a gate.
+    assert rc["npm_resolve_error"] is not None
+    assert "timeout" in rc["npm_resolve_error"]
+    assert rc["cli_probe_status"] == "ok"
+
+
+def test_npm_hard_404_still_gates_availability():
+    """A genuinely unpublished package (404) is still UNAVAILABLE."""
+    assert HyperFramesCompose._is_hard_npm_failure(
+        "npm package `hyperframes` not found (404)"
+    )
+    assert HyperFramesCompose._is_hard_npm_failure("npm view returned empty version")
+    assert not HyperFramesCompose._is_hard_npm_failure(
+        "timeout (5s) -- offline or slow registry"
+    )
+    assert not HyperFramesCompose._is_hard_npm_failure("npm not on PATH")
+    assert not HyperFramesCompose._is_hard_npm_failure("npm view failed: exit 1")
+
+
+def test_cli_failure_gates_despite_npm_ok(monkeypatch):
+    """A broken published CLI is UNAVAILABLE even when npm resolves."""
+    monkeypatch.setattr(
+        HyperFramesCompose, "_npm_resolve_cache", None, raising=False
+    )
+    monkeypatch.setattr(
+        HyperFramesCompose, "_cli_probe_cache", None, raising=False
+    )
+    monkeypatch.setattr(
+        HyperFramesCompose,
+        "_resolve_npm_package",
+        classmethod(lambda cls: {"version": "0.8.80"}),
+    )
+    monkeypatch.setattr(
+        HyperFramesCompose,
+        "_probe_cli",
+        classmethod(lambda cls: {"error": "doctor failed: boom"}),
+    )
+    rc = HyperFramesCompose()._runtime_check()
+    if not _local_floor_met():
+        pytest.skip("Local runtime floor not met on this machine")
+    assert rc["runtime_available"] is False
+    assert any("not executable" in r for r in rc["reasons"])
+
+
+def test_local_floor_missing_gates_availability(monkeypatch):
+    """Missing node / ffmpeg / npx is UNAVAILABLE without any network."""
+    import shutil
+
+    monkeypatch.setattr(
+        HyperFramesCompose, "_node_major_version", classmethod(lambda cls: None)
+    )
+    rc = HyperFramesCompose()._runtime_check()
+    assert rc["runtime_available"] is False
+    assert any("node" in r.lower() for r in rc["reasons"])
+
+    monkeypatch.setattr(
+        HyperFramesCompose, "_node_major_version", classmethod(lambda cls: 22)
+    )
+    real_which = shutil.which
+    monkeypatch.setattr(
+        shutil, "which", lambda name: None if name == "ffmpeg" else real_which(name)
+    )
+    rc = HyperFramesCompose()._runtime_check()
+    assert rc["runtime_available"] is False
+    assert any("ffmpeg" in r.lower() for r in rc["reasons"])
+
+
+def test_real_arm64_preflight_reports_available():
+    """On this ARM64 device the real preflight must report AVAILABLE.
+
+    No mocks: exercises the true `npm view` (slow registry) + real
+    `npx hyperframes doctor` path. Slow (~1-2 min on first run).
+    """
+    import shutil
+
+    if not _local_floor_met():
+        pytest.skip("Local runtime floor not met on this machine")
+    HyperFramesCompose._npm_resolve_cache = None
+    HyperFramesCompose._cli_probe_cache = None
+    try:
+        rc = HyperFramesCompose()._runtime_check()
+    finally:
+        HyperFramesCompose._npm_resolve_cache = None
+        HyperFramesCompose._cli_probe_cache = None
+    assert rc["runtime_available"] is True, (
+        f"Real preflight must be available on this device: {rc['reasons']}"
+    )
+    assert rc["cli_probe_status"] == "ok"

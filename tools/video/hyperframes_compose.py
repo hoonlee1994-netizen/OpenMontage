@@ -323,6 +323,19 @@ class HyperFramesCompose(BaseTool):
             cls._npm_resolve_cache = {"version": version}
         return cls._npm_resolve_cache
 
+    @staticmethod
+    def _is_hard_npm_failure(error: str) -> bool:
+        """True only for failures proving the package itself is unusable.
+
+        Timeouts, offline registries, and slow metadata responses are
+        *soft*: the local runtime may still execute fine (e.g. via the npx
+        cache), so they are diagnostics only and must not gate
+        availability. A 404/unpublished package or an empty version
+        response is *hard*: there is nothing to fetch.
+        """
+        lowered = (error or "").lower()
+        return "404" in lowered or "empty version" in lowered
+
     @classmethod
     def _probe_cli(cls) -> dict[str, str]:
         """Run the published CLI's doctor command once per process.
@@ -331,6 +344,13 @@ class HyperFramesCompose(BaseTool):
         an upstream packaging regression can publish successfully while every
         CLI command crashes during bootstrap. Provider preflight must not call
         that state available.
+
+        Timeout (120s): a real `npx hyperframes doctor` invocation costs
+        25-60s+ on a slow-registry device (npx registry round-trips plus
+        browser env checks), so the old 20s budget timed out on a healthy
+        runtime. This matches the operational doctor path (`_run_hf`
+        allows 180s for the same command); the result is cached per
+        process so `get_status()` pays it once.
         """
         if cls._cli_probe_cache is not None:
             return cls._cli_probe_cache
@@ -345,10 +365,10 @@ class HyperFramesCompose(BaseTool):
                 [npx, "--yes", cls._NPM_PACKAGE, "doctor", "--json"],
                 capture_output=True,
                 text=True,
-                timeout=20,
+                timeout=120,
             )
         except subprocess.TimeoutExpired:
-            cls._cli_probe_cache = {"error": "doctor timed out after 20s"}
+            cls._cli_probe_cache = {"error": "doctor timed out after 120s"}
             return cls._cli_probe_cache
         except (OSError, subprocess.SubprocessError) as exc:
             cls._cli_probe_cache = {"error": f"doctor failed: {type(exc).__name__}"}
@@ -365,10 +385,15 @@ class HyperFramesCompose(BaseTool):
     def _runtime_check(self) -> dict[str, Any]:
         """Return availability state for the HyperFrames runtime.
 
-        Checks BOTH local binaries (node >= 22, ffmpeg, npx) AND that the
-        `hyperframes` npm package actually resolves. A missing/404 package
-        counts as unavailable — `runtime_available: True` means the runtime
-        can genuinely run end-to-end, not just that the local tooling exists.
+        Local prerequisites (node >= 22, ffmpeg, npx) are hard
+        requirements. A successful real CLI probe (`npx hyperframes
+        doctor`) is authoritative evidence the runtime can execute: a
+        slow or unreachable npm registry (e.g. `npm view` timing out on
+        a 5s budget while the real lookup needs 6-8s) is recorded as a
+        diagnostic but does NOT override a working runtime. Only a hard
+        package-resolution failure (404 / unpublished / empty version)
+        still gates availability, since then there is nothing to fetch.
+        A failing CLI probe always gates availability.
         """
         node_major = self._node_major_version()
         ffmpeg_ok = shutil.which("ffmpeg") is not None
@@ -391,11 +416,14 @@ class HyperFramesCompose(BaseTool):
         npm_resolve: dict[str, str] = {}
         if not reasons:
             npm_resolve = self._resolve_npm_package()
-            if "error" in npm_resolve:
+            npm_error = npm_resolve.get("error")
+            if npm_error and self._is_hard_npm_failure(npm_error):
                 reasons.append(
                     f"npm package `{self._NPM_PACKAGE}` not resolvable: "
-                    f"{npm_resolve['error']}"
+                    f"{npm_error}"
                 )
+            # Soft npm failures (timeout / offline / slow registry) stay
+            # diagnostic-only: the CLI probe below decides availability.
 
         cli_probe: dict[str, str] = {}
         if not reasons:

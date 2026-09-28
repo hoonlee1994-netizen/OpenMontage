@@ -8,9 +8,11 @@ by default.
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from tools.base_tool import (
     BaseTool,
@@ -23,6 +25,47 @@ from tools.base_tool import (
     ToolStability,
     ToolTier,
 )
+
+
+def probe_codec_types(path: Path) -> Optional[set[str]]:
+    """Return the ffprobe `codec_type` set for a media file.
+
+    Returns None when probing is unavailable or fails (ffprobe missing,
+    unreadable file, invalid JSON) — callers must treat None as
+    "unknown", never as "has no video".
+    """
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                ffprobe,
+                "-v", "quiet",
+                "-print_format", "json",
+                "-show_streams",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    streams = data.get("streams")
+    if not isinstance(streams, list):
+        return None
+    return {
+        str(s.get("codec_type"))
+        for s in streams
+        if isinstance(s, dict) and s.get("codec_type")
+    }
 
 
 class VideoTrimmer(BaseTool):
@@ -114,30 +157,99 @@ class VideoTrimmer(BaseTool):
             inputs.get("output_path", str(input_path.with_stem(f"{input_path.stem}_cut")))
         )
 
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", str(input_path),
-            "-ss", str(start_s),
-        ]
-        if end_s is not None:
-            cmd.extend(["-to", str(end_s)])
         if codec == "copy":
-            cmd.extend(["-c", "copy"])
+            # Input seeking (-ss BEFORE -i): seeks to the nearest keyframe
+            # and copies from there, so the video stream survives cuts at
+            # non-keyframe positions. Output seeking (-ss after -i) with
+            # `-c copy` can silently drop every video packet (B-frame
+            # reordering / negative timestamps) and emit an audio-only MP4
+            # while ffmpeg still exits 0. With input seeking, -to would be
+            # misinterpreted against the seeked timeline, so express the
+            # window as a duration (-t).
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", str(start_s),
+                "-i", str(input_path),
+            ]
+            if end_s is not None:
+                duration = float(end_s) - float(start_s)
+                cmd.extend(["-t", str(duration)])
+            cmd.extend(["-c", "copy", "-avoid_negative_ts", "make_zero"])
         else:
+            # Re-encode is frame-accurate: output seeking (-ss after -i)
+            # decodes and cuts exactly. Unchanged behavior.
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", str(input_path),
+                "-ss", str(start_s),
+            ]
+            if end_s is not None:
+                cmd.extend(["-to", str(end_s)])
             cmd.extend(["-c:v", codec, "-c:a", "aac"])
         cmd.append(str(output_path))
 
         self.run_command(cmd)
 
+        # Post-cut validation: a video input must yield a video stream.
+        # Never report success for an audio-only cut of a video source.
+        base_data: dict[str, Any] = {
+            "operation": "cut",
+            "input": str(input_path),
+            "output": str(output_path),
+            "start_seconds": start_s,
+            "end_seconds": end_s,
+            "codec": codec,
+        }
+        if not output_path.exists():
+            return ToolResult(
+                success=False,
+                error=(
+                    "FFmpeg exited 0 but the cut output is missing: "
+                    f"{output_path}"
+                ),
+                data=base_data,
+            )
+        input_types = probe_codec_types(input_path)
+        output_types = probe_codec_types(output_path)
+        base_data["input_streams"] = sorted(input_types) if input_types is not None else None
+        base_data["output_streams"] = sorted(output_types) if output_types is not None else None
+        if output_types is None:
+            # Probe inconclusive — do not claim a verified success, but
+            # leave the file in place for manual inspection.
+            return ToolResult(
+                success=False,
+                error=(
+                    "Cut output could not be stream-validated (ffprobe "
+                    f"unavailable or failed); not claiming success. Output "
+                    f"left at {output_path} for manual inspection."
+                ),
+                data=base_data,
+            )
+        if "video" in (input_types or set()) and "video" not in output_types:
+            # Copy mode dropped the video stream (typically a non-keyframe
+            # cut). Never report success; remove the invalid artifact and
+            # point at re-encode mode. Do NOT silently fall back to a lossy
+            # re-encode of an explicitly requested codec="copy" operation.
+            try:
+                output_path.unlink()
+            except OSError:
+                pass
+            return ToolResult(
+                success=False,
+                error=(
+                    "copy-mode cut produced no video stream (input has "
+                    f"video; output streams: {sorted(output_types)}). "
+                    "Stream-copy cannot cut accurately at this position; "
+                    "retry with codec='libx264' (re-encode) instead of "
+                    "codec='copy'. The invalid output was removed."
+                ),
+                data=base_data,
+            )
+
+        base_data["output_has_video"] = "video" in output_types
         return ToolResult(
             success=True,
-            data={
-                "operation": "cut",
-                "input": str(input_path),
-                "output": str(output_path),
-                "start_seconds": start_s,
-                "end_seconds": end_s,
-            },
+            data=base_data,
             artifacts=[str(output_path)],
         )
 

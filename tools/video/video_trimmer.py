@@ -68,25 +68,63 @@ def probe_codec_types(path: Path) -> Optional[set[str]]:
     }
 
 
-# Copy-mode timing contract (B1 corrective repair).
+# Copy-mode timing contract (B1 corrective repair v3).
 #
 # Stream-copy (`codec="copy"`) with input seeking (`-ss` before `-i`) starts
 # from the preceding keyframe, so the produced window can be materially
 # longer/shifted versus the requested [start, end) interval. The tool must
 # not silently report such a window as success.
 #
-# Contract: for codec="copy" with an explicit end_seconds, the ffprobe
-# format duration of the output must satisfy
-#   |actual_duration - requested_duration| <= COPY_DURATION_TOLERANCE_SEC
-# otherwise the cut fails closed with a re-encode recommendation. Re-encode
-# mode is frame-accurate and is not subject to this gate.
+# Two gates enforce truthfulness:
 #
-# Tolerance rationale: dense-GOP fixtures (keyframe every ~0.4s) show
-# packet-granularity jitter of ~0.17-0.27s on valid copy cuts, while the
-# failing sparse-GOP 1.7-4.3s case overshoots by ~1.87s (2.6s requested vs
-# ~4.47s actual). 0.5s accepts the former and rejects the latter with
-# margin on both sides.
-COPY_DURATION_TOLERANCE_SEC = 0.5
+# 1. Keyframe-alignment gate (pre-FFmpeg, video copy only): a nonzero start
+#    must lie within KEYFRAME_ALIGN_TOLERANCE_SEC of an actual video
+#    keyframe timestamp obtained via ffprobe (`-skip_frame nokey`). This
+#    proves stream-copy can honor the requested start; otherwise the tool
+#    fails closed and directs the caller to re-encode. start==0 is naturally
+#    eligible and skips the probe.
+#
+# 2. Duration gate (post-output, explicit windows): the ffprobe format
+#    duration of the output must satisfy
+#      |actual - requested| <= allowed
+#    where allowed = min(COPY_ABSOLUTE_CAP_SEC,
+#                        requested * COPY_RELATIVE_TOLERANCE).
+#    Re-encode mode is frame-accurate and is not subject to either gate.
+#
+# Tolerance rationale (observed on 30 fps H.264 fixtures outside the repo):
+# - Keyframe-aligned dense-GOP (GOP=12, keyframe every 0.40 s) 3.0 s copies
+#   overshoot by ~0.13-0.22 s from packet/container granularity (AAC frame
+#   ~0.023 s, video frame ~0.033 s, MP4 muxing plus -avoid_negative_ts
+#   make_zero). Sparse start=0 3.0 s copies overshoot ~0.13 s.
+# - KEYFRAME_ALIGN_TOLERANCE_SEC=0.05 s covers ~1-2 video frames at 24-30 fps
+#   plus timestamp quantization, while staying 8x below the dense GOP spacing
+#   (0.40 s), so mid-GOP positions (e.g. 1.7 is 0.10 s from 1.6) are rejected.
+# - COPY_ABSOLUTE_CAP_SEC=0.30 s sits just above the worst legitimate jitter
+#   (~0.22 s) with margin, yet strictly below one dense GOP (0.40 s), so any
+#   copy that drags in an extra GOP fails even if the keyframe gate missed.
+# - COPY_RELATIVE_TOLERANCE=0.10 (10 %) keeps short windows strict: a 0.8 s
+#   request allows only 0.08 s, so the observed 0.8->1.275 s case (delta
+#   0.475 s, 59 %) and 0.8->1.034 s case (delta 0.234 s, 29 %) both fail and
+#   require re-encode, while a 3.0 s request allows 0.30 s so the legitimate
+#   ~0.17 s deviation passes. For long clips the absolute cap prevents the
+#   tolerance from growing unbounded (10 % of 30 s would be 3 s of slack).
+COPY_ABSOLUTE_CAP_SEC = 0.30
+COPY_RELATIVE_TOLERANCE = 0.10
+KEYFRAME_ALIGN_TOLERANCE_SEC = 0.05
+# Deprecated fixed-threshold alias kept for import compatibility. Do NOT use
+# for gating; the truthful gate is copy_allowed_delta().
+COPY_DURATION_TOLERANCE_SEC = COPY_ABSOLUTE_CAP_SEC
+
+
+def copy_allowed_delta(requested_duration: float) -> float:
+    """Bounded proportional tolerance for copy-mode duration validation."""
+    try:
+        req = float(requested_duration)
+    except (TypeError, ValueError):
+        return COPY_ABSOLUTE_CAP_SEC
+    if req <= 0:
+        return 0.0
+    return min(COPY_ABSOLUTE_CAP_SEC, req * COPY_RELATIVE_TOLERANCE)
 
 
 def probe_output_duration(path: Path) -> Optional[float]:
@@ -122,6 +160,85 @@ def probe_output_duration(path: Path) -> Optional[float]:
         return float(fmt.get("duration"))
     except (TypeError, ValueError):
         return None
+
+
+def probe_keyframe_times(path: Path) -> Optional[list[float]]:
+    """Return sorted video keyframe timestamps (seconds) via ffprobe.
+
+    Uses `-skip_frame nokey` so only keyframes are decoded, reading
+    `best_effort_timestamp_time` which is populated on this ffprobe build
+    (pkt_pts_time alone is empty here). Returns None when probing is
+    unavailable or fails (ffprobe missing, unreadable file, invalid JSON,
+    no video stream / no keyframes found) — callers must treat None as
+    "unknown", never as "aligned" or "no keyframes".
+    """
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                ffprobe,
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-skip_frame", "nokey",
+                "-show_entries", "frame=best_effort_timestamp_time",
+                "-of", "json",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    frames = data.get("frames")
+    if not isinstance(frames, list) or len(frames) == 0:
+        return None
+    times: list[float] = []
+    for fr in frames:
+        if not isinstance(fr, dict):
+            continue
+        raw = fr.get("best_effort_timestamp_time")
+        try:
+            times.append(float(raw))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+    if not times:
+        return None
+    return sorted(times)
+
+
+def _try_remove_artifact(path: Path) -> tuple[bool, bool]:
+    """Attempt to delete an invalid output artifact.
+
+    Returns (removed, exists_after): removed is True only when unlink
+    succeeded (or the file was already absent); exists_after reports
+    whether the path still exists afterwards. Cleanup failure never
+    converts media failure into success — callers must stay success=False.
+    """
+    try:
+        path.unlink()
+        removed = True
+    except FileNotFoundError:
+        removed = True
+    except OSError:
+        removed = False
+    try:
+        exists_after = path.exists()
+    except OSError:
+        exists_after = True
+    if not exists_after:
+        removed = True
+    else:
+        removed = False
+    return removed, exists_after
 
 
 class VideoTrimmer(BaseTool):
@@ -213,6 +330,203 @@ class VideoTrimmer(BaseTool):
             inputs.get("output_path", str(input_path.with_stem(f"{input_path.stem}_cut")))
         )
 
+        # ---- 1. Interval validation BEFORE FFmpeg (no artifact) ----
+        try:
+            start_f = float(start_s)
+        except (TypeError, ValueError):
+            return ToolResult(
+                success=False,
+                error=(
+                    "Invalid cut interval: start_seconds "
+                    f"({start_s!r}) is not a number. No FFmpeg "
+                    "operation was executed and no artifact was created."
+                ),
+                data={
+                    "operation": "cut",
+                    "input": str(input_path),
+                    "output": str(output_path),
+                    "start_seconds": start_s,
+                    "end_seconds": end_s,
+                    "codec": codec,
+                },
+            )
+        if start_f < 0:
+            return ToolResult(
+                success=False,
+                error=(
+                    "Invalid cut interval: start_seconds "
+                    f"({start_f}) must be >= 0. No FFmpeg operation "
+                    "was executed and no artifact was created."
+                ),
+                data={
+                    "operation": "cut",
+                    "input": str(input_path),
+                    "output": str(output_path),
+                    "start_seconds": start_s,
+                    "end_seconds": end_s,
+                    "codec": codec,
+                },
+            )
+        requested_duration: Optional[float] = None
+        if end_s is not None:
+            try:
+                end_f = float(end_s)
+            except (TypeError, ValueError):
+                return ToolResult(
+                    success=False,
+                    error=(
+                        "Invalid cut interval: end_seconds "
+                        f"({end_s!r}) is not a number. No FFmpeg "
+                        "operation was executed and no artifact was created."
+                    ),
+                    data={
+                        "operation": "cut",
+                        "input": str(input_path),
+                        "output": str(output_path),
+                        "start_seconds": start_s,
+                        "end_seconds": end_s,
+                        "codec": codec,
+                    },
+                )
+            requested_duration = end_f - start_f
+            if not (end_f > start_f):
+                return ToolResult(
+                    success=False,
+                    error=(
+                        "Invalid cut interval: end_seconds "
+                        f"({end_f}) must be greater than start_seconds "
+                        f"({start_f}); requested_duration={requested_duration}. "
+                        "No FFmpeg operation was executed and no artifact "
+                        "was created."
+                    ),
+                    data={
+                        "operation": "cut",
+                        "input": str(input_path),
+                        "output": str(output_path),
+                        "start_seconds": start_s,
+                        "end_seconds": end_s,
+                        "codec": codec,
+                        "requested_duration": requested_duration,
+                    },
+                )
+
+        # ---- 2. Input probe BEFORE FFmpeg: fail closed on unknown ----
+        # Never infer audio-only from unknown. Unknown is distinct from
+        # known_audio_only and can never support a media-preservation claim.
+        # Never use filename extensions as proof of stream type.
+        input_types = probe_codec_types(input_path)
+        input_unknown = input_types is None or len(input_types) == 0
+        input_known_video = not input_unknown and "video" in (input_types or set())
+        input_known_audio_only = not input_unknown and "video" not in (input_types or set())
+        input_probe = (
+            "known_video" if input_known_video
+            else "known_audio_only" if input_known_audio_only
+            else "unknown"
+        )
+        if input_unknown:
+            return ToolResult(
+                success=False,
+                error=(
+                    "Cut input stream probe is unknown/inconclusive "
+                    f"(input_streams={sorted(input_types) if input_types is not None else None}); "
+                    "media preservation cannot be established, so success "
+                    "is denied (fail-closed). This unknown-probe state is "
+                    "distinct from positively identified audio-only input "
+                    "and is never equivalent to audio-only. No FFmpeg "
+                    "operation was executed and no artifact was created; "
+                    "re-probe the input or retry once the source streams "
+                    "are known."
+                ),
+                data={
+                    "operation": "cut",
+                    "input": str(input_path),
+                    "output": str(output_path),
+                    "start_seconds": start_s,
+                    "end_seconds": end_s,
+                    "codec": codec,
+                    "requested_duration": requested_duration,
+                    "input_streams": sorted(input_types) if input_types is not None else None,
+                    "input_probe": "unknown",
+                },
+            )
+
+        # ---- 3. Keyframe-alignment gate for video stream-copy ----
+        # Only for positively identified VIDEO input with codec="copy".
+        # start==0 is naturally eligible and skips the probe. A nonzero
+        # start must lie within KEYFRAME_ALIGN_TOLERANCE_SEC of an actual
+        # ffprobe keyframe timestamp; GOP assumptions, container type, and
+        # filename are never used as proof. On misalignment (or unknown
+        # keyframes) fail BEFORE the copy so no invalid artifact is made.
+        keyframe_aligned: Optional[bool] = None
+        nearest_kf: Optional[float] = None
+        kf_distance: Optional[float] = None
+        if input_known_video and codec == "copy" and start_f != 0:
+            kf_times = probe_keyframe_times(input_path)
+            if kf_times is None:
+                return ToolResult(
+                    success=False,
+                    error=(
+                        "copy-mode cut start cannot be proven keyframe-aligned "
+                        f"(start_seconds={start_f}; keyframe probe unknown/failed). "
+                        "Stream-copy starts from the preceding keyframe and is not "
+                        "frame-accurate; exact arbitrary-position trimming requires "
+                        "re-encode. Retry with codec='libx264' (re-encode) instead of "
+                        "codec='copy'. No FFmpeg copy operation was executed and no "
+                        "artifact was created."
+                    ),
+                    data={
+                        "operation": "cut",
+                        "input": str(input_path),
+                        "output": str(output_path),
+                        "start_seconds": start_s,
+                        "end_seconds": end_s,
+                        "codec": codec,
+                        "requested_duration": requested_duration,
+                        "input_streams": sorted(input_types or set()),
+                        "input_probe": input_probe,
+                        "keyframe_aligned": None,
+                        "keyframe_tolerance_sec": KEYFRAME_ALIGN_TOLERANCE_SEC,
+                    },
+                )
+            nearest_kf = min(kf_times, key=lambda t: abs(t - start_f))
+            kf_distance = abs(nearest_kf - start_f)
+            if kf_distance > KEYFRAME_ALIGN_TOLERANCE_SEC:
+                return ToolResult(
+                    success=False,
+                    error=(
+                        f"copy-mode cut start {start_f}s is not keyframe-aligned "
+                        f"(nearest video keyframe at {nearest_kf:.6f}s, distance "
+                        f"{kf_distance:.6f}s > tolerance "
+                        f"{KEYFRAME_ALIGN_TOLERANCE_SEC:.3f}s). Stream-copy starts from "
+                        "the preceding keyframe and is not frame-accurate; exact "
+                        "arbitrary-position trimming requires re-encode. Retry with "
+                        "codec='libx264' (re-encode) instead of codec='copy'. No "
+                        "FFmpeg copy operation was executed and no artifact was "
+                        "created; nothing was silently re-encoded."
+                    ),
+                    data={
+                        "operation": "cut",
+                        "input": str(input_path),
+                        "output": str(output_path),
+                        "start_seconds": start_s,
+                        "end_seconds": end_s,
+                        "codec": codec,
+                        "requested_duration": requested_duration,
+                        "input_streams": sorted(input_types or set()),
+                        "input_probe": input_probe,
+                        "keyframe_aligned": False,
+                        "nearest_keyframe": nearest_kf,
+                        "keyframe_distance": kf_distance,
+                        "keyframe_tolerance_sec": KEYFRAME_ALIGN_TOLERANCE_SEC,
+                        "keyframe_count": len(kf_times),
+                    },
+                )
+            keyframe_aligned = True
+        elif input_known_video and codec == "copy" and start_f == 0:
+            keyframe_aligned = True
+            nearest_kf = 0.0
+            kf_distance = 0.0
+
         if codec == "copy":
             # Input seeking (-ss BEFORE -i): seeks to the nearest keyframe
             # and copies from there, so the video stream survives cuts at
@@ -246,20 +560,15 @@ class VideoTrimmer(BaseTool):
 
         self.run_command(cmd)
 
-        # Post-cut validation (B1 fail-safe contract):
-        # - success=True must mean the output is PROVEN to contain video
-        #   whenever the trim is a video trim.
-        # - input probe None/empty is UNKNOWN, distinct from positively
-        #   identified audio-only. Never infer audio-only from unknown.
-        # - copy mode must satisfy the requested window within
-        #   COPY_DURATION_TOLERANCE_SEC or fail with a re-encode direction.
+        # Post-cut validation (B1 fail-safe contract v3):
+        # - success=True must mean the output is PROVEN to contain the
+        #   required stream(s) for the positively identified input type.
+        # - copy mode with an explicit window must additionally satisfy the
+        #   bounded proportional duration gate.
         # Never use filename extensions as proof of stream type.
-        requested_duration: Optional[float] = None
-        if end_s is not None:
-            try:
-                requested_duration = float(end_s) - float(start_s)
-            except (TypeError, ValueError):
-                requested_duration = None
+        allowed_tolerance: Optional[float] = None
+        if codec == "copy" and requested_duration is not None:
+            allowed_tolerance = copy_allowed_delta(requested_duration)
         base_data: dict[str, Any] = {
             "operation": "cut",
             "input": str(input_path),
@@ -268,9 +577,17 @@ class VideoTrimmer(BaseTool):
             "end_seconds": end_s,
             "codec": codec,
             "requested_duration": requested_duration,
-            "copy_duration_tolerance_sec": (
-                COPY_DURATION_TOLERANCE_SEC if codec == "copy" else None
+            "allowed_tolerance": allowed_tolerance,
+            "copy_duration_tolerance_sec": allowed_tolerance if codec == "copy" else None,
+            "copy_absolute_cap_sec": COPY_ABSOLUTE_CAP_SEC if codec == "copy" else None,
+            "copy_relative_fraction": COPY_RELATIVE_TOLERANCE if codec == "copy" else None,
+            "keyframe_aligned": keyframe_aligned,
+            "keyframe_tolerance_sec": (
+                KEYFRAME_ALIGN_TOLERANCE_SEC
+                if (input_known_video and codec == "copy") else None
             ),
+            "nearest_keyframe": nearest_kf,
+            "keyframe_distance": kf_distance,
         }
         if not output_path.exists():
             return ToolResult(
@@ -281,25 +598,16 @@ class VideoTrimmer(BaseTool):
                 ),
                 data=base_data,
             )
-        input_types = probe_codec_types(input_path)
+        # Re-probe input for the record (unchanged file) and probe output.
+        input_types_post = probe_codec_types(input_path)
         output_types = probe_codec_types(output_path)
-        base_data["input_streams"] = sorted(input_types) if input_types is not None else None
-        base_data["output_streams"] = sorted(output_types) if output_types is not None else None
-        # Probe state classification: None or empty means UNKNOWN, never
-        # "known audio-only". Only a non-empty set without "video" is
-        # positively identified audio-only (or at least non-video).
-        input_unknown = input_types is None or len(input_types) == 0
-        input_known_video = (
-            not input_unknown and "video" in (input_types or set())
+        base_data["input_streams"] = (
+            sorted(input_types_post) if input_types_post is not None else None
         )
-        input_known_audio_only = (
-            not input_unknown and "video" not in (input_types or set())
+        base_data["output_streams"] = (
+            sorted(output_types) if output_types is not None else None
         )
-        base_data["input_probe"] = (
-            "known_video" if input_known_video
-            else "known_audio_only" if input_known_audio_only
-            else "unknown"
-        )
+        base_data["input_probe"] = input_probe
         if output_types is None:
             # Output probe inconclusive — do not claim a verified success,
             # but leave the file in place for manual inspection.
@@ -315,75 +623,191 @@ class VideoTrimmer(BaseTool):
                 data=base_data,
             )
         base_data["output_probe"] = "known"
-        if "video" not in output_types:
-            # Output is provably audio-only (or at least non-video).
-            if input_unknown:
-                # Fail closed: input might have been video; an audio-only
-                # result must never pass as a successful video trim. Do not
-                # infer the source was audio-only. Remove the artifact so a
-                # false success cannot be consumed downstream.
-                try:
-                    output_path.unlink()
-                except OSError:
-                    pass
-                return ToolResult(
-                    success=False,
-                    error=(
-                        "Cut produced audio-only output while the input "
-                        "stream probe is unknown/inconclusive "
-                        f"(input_streams={base_data['input_streams']}; "
-                        f"output_streams={sorted(output_types)}). Video "
-                        "preservation cannot be established, so success "
-                        "is denied (fail-closed). This unknown-probe state "
-                        "is distinct from positively identified audio-only "
-                        "input. The invalid output was removed; re-probe "
-                        "the input or retry with codec='libx264' "
-                        "(re-encode) once the source streams are known."
-                    ),
-                    data=base_data,
+        if len(output_types) == 0:
+            # Provably empty stream set — failure for every input type.
+            # An empty set is never "audio-only" and never "video".
+            removed, exists_after = _try_remove_artifact(output_path)
+            base_data["cleanup_attempted"] = True
+            base_data["cleanup_removed"] = removed
+            base_data["output_exists_after_cleanup"] = exists_after
+            cleanup_note = (
+                "The invalid output was removed."
+                if removed and not exists_after
+                else (
+                    f"Attempted removal of the invalid output failed "
+                    f"(cleanup_removed={removed}, "
+                    f"output_exists_after_cleanup={exists_after}); "
+                    f"manual deletion of {output_path} may be required."
                 )
-            if input_known_video:
+            )
+            if input_probe != "known_audio_only":
+                empty_err = (
+                    "Cut produced an output with an empty stream set "
+                    f"(input_probe={input_probe}; output_streams=[]). An empty "
+                    "stream set never counts as successful media preservation "
+                    "(fail-closed). "
+                    + cleanup_note
+                    + " Retry with codec='libx264' (re-encode) once the source "
+                    "streams are known."
+                )
+            else:
+                empty_err = (
+                    "Cut produced an output with an empty stream set "
+                    f"(input_probe={input_probe}; output_streams=[]). An empty "
+                    "stream set never counts as successful audio trimming "
+                    "(fail-closed). "
+                    + cleanup_note
+                )
+            return ToolResult(
+                success=False,
+                error=empty_err,
+                data=base_data,
+            )
+        if input_known_video:
+            if "video" not in output_types:
                 # Copy mode dropped the video stream (typically a non-keyframe
-                # cut). Never report success; remove the invalid artifact and
-                # point at re-encode mode. Do NOT silently fall back to a lossy
-                # re-encode of an explicitly requested codec="copy" operation.
-                try:
-                    output_path.unlink()
-                except OSError:
-                    pass
-                return ToolResult(
-                    success=False,
-                    error=(
+                # cut) or re-encode lost video. Never report success; attempt
+                # removal and report the outcome truthfully. Do NOT silently
+                # fall back to a lossy re-encode of an explicitly requested
+                # codec="copy" operation.
+                removed, exists_after = _try_remove_artifact(output_path)
+                base_data["cleanup_attempted"] = True
+                base_data["cleanup_removed"] = removed
+                base_data["output_exists_after_cleanup"] = exists_after
+                cleanup_note = (
+                    "The invalid output was removed."
+                    if removed and not exists_after
+                    else (
+                        f"Attempted removal of the invalid output failed "
+                        f"(cleanup_removed={removed}, "
+                        f"output_exists_after_cleanup={exists_after}); "
+                        f"manual deletion of {output_path} may be required."
+                    )
+                )
+                if codec == "copy":
+                    novideo_err = (
                         "copy-mode cut produced no video stream (input has "
                         f"video; output streams: {sorted(output_types)}). "
                         "Stream-copy cannot cut accurately at this position; "
                         "retry with codec='libx264' (re-encode) instead of "
-                        "codec='copy'. The invalid output was removed."
-                    ),
+                        "codec='copy'. " + cleanup_note
+                    )
+                else:
+                    novideo_err = (
+                        "cut produced no video stream (input has "
+                        f"video; output streams: {sorted(output_types)}). "
+                        "Video preservation cannot be established "
+                        "(fail-closed). " + cleanup_note
+                    )
+                return ToolResult(
+                    success=False,
+                    error=novideo_err,
                     data=base_data,
                 )
-            # Positively identified audio-only input -> audio-only output is
-            # the supported path.
-            base_data["output_has_video"] = False
+            # Output provably contains video. For copy mode with an explicit
+            # window, additionally enforce the bounded proportional timing
+            # contract.
+            if codec == "copy" and requested_duration is not None:
+                actual_duration = probe_output_duration(output_path)
+                base_data["actual_duration"] = actual_duration
+                if actual_duration is None:
+                    # Cannot validate the cut window — fail closed, leave the
+                    # file for manual inspection (timing unproven, streams OK).
+                    return ToolResult(
+                        success=False,
+                        error=(
+                            "copy-mode cut output has video but its duration "
+                            "could not be validated (ffprobe duration probe "
+                            "unknown/failed); not claiming the requested "
+                            f"[{start_s}, {end_s}] window. Output left at "
+                            f"{output_path} for manual inspection."
+                        ),
+                        data=base_data,
+                    )
+                delta = abs(actual_duration - requested_duration)
+                base_data["duration_delta"] = delta
+                assert allowed_tolerance is not None
+                if delta > allowed_tolerance:
+                    removed, exists_after = _try_remove_artifact(output_path)
+                    base_data["cleanup_attempted"] = True
+                    base_data["cleanup_removed"] = removed
+                    base_data["output_exists_after_cleanup"] = exists_after
+                    cleanup_note = (
+                        "The invalid output was removed."
+                        if removed and not exists_after
+                        else (
+                            f"Attempted removal of the invalid output failed "
+                            f"(cleanup_removed={removed}, "
+                            f"output_exists_after_cleanup={exists_after}); "
+                            f"manual deletion of {output_path} may be required."
+                        )
+                    )
+                    return ToolResult(
+                        success=False,
+                        error=(
+                            "copy-mode cut cannot satisfy the requested "
+                            f"[{start_s}, {end_s}] window within tolerance "
+                            f"(requested {requested_duration:.3f}s, actual "
+                            f"{actual_duration:.3f}s, delta {delta:.3f}s > "
+                            f"allowed {allowed_tolerance:.3f}s "
+                            f"[min(cap {COPY_ABSOLUTE_CAP_SEC:.3f}s, "
+                            f"requested*frac {requested_duration:.3f}s*"
+                            f"{COPY_RELATIVE_TOLERANCE:.2f}= "
+                            f"{requested_duration * COPY_RELATIVE_TOLERANCE:.3f}s)]). "
+                            "Stream-copy starts from the preceding keyframe and "
+                            "is not frame-accurate; retry with codec='libx264' "
+                            "(re-encode) instead of codec='copy'. " + cleanup_note
+                        ),
+                        data=base_data,
+                    )
+            else:
+                base_data["actual_duration"] = probe_output_duration(output_path)
+
+            base_data["output_has_video"] = "video" in output_types
+            base_data["output_has_audio"] = "audio" in output_types
             return ToolResult(
                 success=True,
                 data=base_data,
                 artifacts=[str(output_path)],
             )
-        # Output provably contains video. For copy mode with an explicit
-        # window, additionally enforce the timing contract.
+        # Positively identified audio-only input.
+        if "audio" not in output_types:
+            removed, exists_after = _try_remove_artifact(output_path)
+            base_data["cleanup_attempted"] = True
+            base_data["cleanup_removed"] = removed
+            base_data["output_exists_after_cleanup"] = exists_after
+            cleanup_note = (
+                "The invalid output was removed."
+                if removed and not exists_after
+                else (
+                    f"Attempted removal of the invalid output failed "
+                    f"(cleanup_removed={removed}, "
+                    f"output_exists_after_cleanup={exists_after}); "
+                    f"manual deletion of {output_path} may be required."
+                )
+            )
+            return ToolResult(
+                success=False,
+                error=(
+                    "audio-only cut produced output without an audio stream "
+                    f"(input streams: {sorted(input_types or set())}; output "
+                    f"streams: {sorted(output_types)}). Audio preservation "
+                    "cannot be established (fail-closed). " + cleanup_note
+                ),
+                data=base_data,
+            )
+        # Output provably contains audio. For copy mode with an explicit
+        # window, enforce the same bounded proportional timing contract.
         if codec == "copy" and requested_duration is not None:
             actual_duration = probe_output_duration(output_path)
             base_data["actual_duration"] = actual_duration
             if actual_duration is None:
-                # Cannot validate the cut window — fail closed, leave the
-                # file for manual inspection (timing unproven, streams OK).
                 return ToolResult(
                     success=False,
                     error=(
-                        "copy-mode cut output has video but its duration "
-                        "could not be validated (ffprobe duration probe "
-                        "unknown/failed); not claiming the requested "
+                        "audio-only copy-mode cut output has audio but its "
+                        "duration could not be validated (ffprobe duration "
+                        "probe unknown/failed); not claiming the requested "
                         f"[{start_s}, {end_s}] window. Output left at "
                         f"{output_path} for manual inspection."
                     ),
@@ -391,33 +815,38 @@ class VideoTrimmer(BaseTool):
                 )
             delta = abs(actual_duration - requested_duration)
             base_data["duration_delta"] = delta
-            if delta > COPY_DURATION_TOLERANCE_SEC:
-                try:
-                    output_path.unlink()
-                except OSError:
-                    pass
+            assert allowed_tolerance is not None
+            if delta > allowed_tolerance:
+                removed, exists_after = _try_remove_artifact(output_path)
+                base_data["cleanup_attempted"] = True
+                base_data["cleanup_removed"] = removed
+                base_data["output_exists_after_cleanup"] = exists_after
+                cleanup_note = (
+                    "The invalid output was removed."
+                    if removed and not exists_after
+                    else (
+                        f"Attempted removal of the invalid output failed "
+                        f"(cleanup_removed={removed}, "
+                        f"output_exists_after_cleanup={exists_after}); "
+                        f"manual deletion of {output_path} may be required."
+                    )
+                )
                 return ToolResult(
                     success=False,
                     error=(
-                        "copy-mode cut cannot satisfy the requested "
+                        "audio-only copy-mode cut cannot satisfy the requested "
                         f"[{start_s}, {end_s}] window within tolerance "
                         f"(requested {requested_duration:.3f}s, actual "
                         f"{actual_duration:.3f}s, delta {delta:.3f}s > "
-                        f"tolerance {COPY_DURATION_TOLERANCE_SEC:.3f}s). "
-                        "Stream-copy starts from the preceding keyframe and "
-                        "is not frame-accurate; retry with codec='libx264' "
-                        "(re-encode) instead of codec='copy'. The invalid "
-                        "output was removed."
+                        f"allowed {allowed_tolerance:.3f}s). Retry with a "
+                        "re-encode codec instead of codec='copy'. " + cleanup_note
                     ),
                     data=base_data,
                 )
         else:
-            base_data["actual_duration"] = (
-                probe_output_duration(output_path)
-                if "video" in output_types else None
-            )
-
+            base_data["actual_duration"] = probe_output_duration(output_path)
         base_data["output_has_video"] = "video" in output_types
+        base_data["output_has_audio"] = "audio" in output_types
         return ToolResult(
             success=True,
             data=base_data,

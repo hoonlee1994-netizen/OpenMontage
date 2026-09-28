@@ -898,71 +898,205 @@ class VideoTrimmer(BaseTool):
 
         output_path = Path(inputs.get("output_path", "concat_output.mp4"))
 
-        # First, cut each segment to a temp file if start/end are specified
+        # Codec finding (documented before behavior change): the shared
+        # input_schema advertises top-level "codec" (default "copy"), but
+        # _concat historically ignored it and hardcoded `-c copy` for
+        # trimmed segments. Trimmed segments now honor it by delegating to
+        # _cut (default "copy" preserves the previous stream-copy meaning;
+        # an explicit caller-supplied codec such as "libx264" yields a
+        # frame-accurate re-encode trim under the same _cut contract — this
+        # is caller-requested, never a silent fallback). Untrimmed segments
+        # are passed through untouched regardless of codec.
+        codec = inputs.get("codec", "copy")
+
+        # temp_files: ONLY files created inside temp_dir (safe to delete).
+        # concat_inputs: ordered entries for the concat list (temp files for
+        # trimmed segments, original paths for untrimmed segments — originals
+        # must never be deleted).
         temp_files: list[Path] = []
+        concat_inputs: list[Path] = []
         temp_dir = output_path.parent / ".concat_tmp"
         temp_dir.mkdir(parents=True, exist_ok=True)
+        list_path = temp_dir / "concat_list.txt"
 
+        def _cleanup_temps() -> dict[str, Any]:
+            """Remove temp files created during this concat attempt.
+
+            Never touches original inputs. Reports truthfully: per-file
+            removal outcome plus whether the temp dir still exists.
+            """
+            file_details: list[dict[str, Any]] = []
+            for tf in temp_files:
+                if tf.parent != temp_dir:
+                    continue  # never delete original inputs
+                removed, exists_after = _try_remove_artifact(tf)
+                file_details.append(
+                    {
+                        "path": str(tf),
+                        "removed": removed,
+                        "exists_after": exists_after,
+                    }
+                )
+            list_removed: Optional[bool] = None
+            if list_path.exists():
+                list_removed, list_exists_after = _try_remove_artifact(list_path)
+            else:
+                list_exists_after = False
+            try:
+                temp_dir.rmdir()
+            except OSError:
+                pass
+            try:
+                temp_dir_exists_after = temp_dir.exists()
+            except OSError:
+                temp_dir_exists_after = True
+            return {
+                "cleanup_attempted": True,
+                "temp_file_details": file_details,
+                "concat_list_removed": list_removed,
+                "concat_list_exists_after": list_exists_after,
+                "temp_dir_exists_after": temp_dir_exists_after,
+            }
+
+        for i, seg in enumerate(segments):
+            seg_input = Path(seg["input_path"])
+            if not seg_input.exists():
+                cleanup = _cleanup_temps()
+                return ToolResult(
+                    success=False,
+                    error=(
+                        f"concat segment {i} input not found: {seg_input}; "
+                        f"concat aborted before final join "
+                        f"({len(segments)} segments requested). "
+                        "No final artifact was created."
+                    ),
+                    data={
+                        "operation": "concat",
+                        "segment_count": len(segments),
+                        "failed_segment_index": i,
+                        "segment_input": str(seg_input),
+                        "final_output_created": False,
+                        **cleanup,
+                    },
+                )
+
+            seg_start = seg.get("start_seconds")
+            seg_end = seg.get("end_seconds")
+
+            if seg_start is not None or seg_end is not None:
+                # Single trimming authority: delegate to the hardened _cut
+                # contract (interval validation, fail-closed probe, video
+                # keyframe-alignment gate, bounded copy-duration semantics,
+                # required output streams, truthful cleanup). No independent
+                # stream-copy path is maintained here; a failed trim must
+                # never enter the concat list.
+                temp_path = temp_dir / f"seg_{i:04d}{seg_input.suffix}"
+                trim_result = self._cut(
+                    {
+                        "input_path": str(seg_input),
+                        "output_path": str(temp_path),
+                        "start_seconds": seg_start if seg_start is not None else 0,
+                        "end_seconds": seg_end,
+                        "codec": codec,
+                    }
+                )
+                if not trim_result.success:
+                    cleanup = _cleanup_temps()
+                    return ToolResult(
+                        success=False,
+                        error=(
+                            f"concat segment {i} trim failed; concat aborted "
+                            f"before final join ({len(segments)} segments "
+                            f"requested). Underlying trim error: "
+                            f"{trim_result.error}"
+                        ),
+                        data={
+                            "operation": "concat",
+                            "segment_count": len(segments),
+                            "failed_segment_index": i,
+                            "segment_input": str(seg_input),
+                            "segment_start_seconds": seg_start,
+                            "segment_end_seconds": seg_end,
+                            "codec": codec,
+                            "trim_error": trim_result.error,
+                            "trim_data": trim_result.data,
+                            "final_output_created": False,
+                            **cleanup,
+                        },
+                    )
+                if not temp_path.exists():
+                    # Defensive: _cut claimed success but left no file; do
+                    # not let a missing entry reach the concat list.
+                    cleanup = _cleanup_temps()
+                    return ToolResult(
+                        success=False,
+                        error=(
+                            f"concat segment {i} trim reported success but "
+                            f"its output is missing ({temp_path}); concat "
+                            f"aborted before final join ({len(segments)} "
+                            "segments requested). No final artifact was "
+                            "created."
+                        ),
+                        data={
+                            "operation": "concat",
+                            "segment_count": len(segments),
+                            "failed_segment_index": i,
+                            "segment_input": str(seg_input),
+                            "segment_start_seconds": seg_start,
+                            "segment_end_seconds": seg_end,
+                            "codec": codec,
+                            "trim_error": None,
+                            "trim_data": trim_result.data,
+                            "final_output_created": False,
+                            **cleanup,
+                        },
+                    )
+                temp_files.append(temp_path)
+                concat_inputs.append(temp_path)
+            else:
+                concat_inputs.append(seg_input)
+
+        # Write concat file list
+        with open(list_path, "w", encoding="utf-8") as f:
+            for tf in concat_inputs:
+                # FFmpeg concat demuxer needs forward slashes and escaped quotes
+                safe_path = str(tf.resolve()).replace("\\", "/")
+                f.write(f"file '{safe_path}'\n")
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", str(list_path),
+            "-c", "copy",
+            str(output_path),
+        ]
         try:
-            for i, seg in enumerate(segments):
-                seg_input = Path(seg["input_path"])
-                if not seg_input.exists():
-                    return ToolResult(success=False, error=f"Segment input not found: {seg_input}")
-
-                seg_start = seg.get("start_seconds")
-                seg_end = seg.get("end_seconds")
-
-                if seg_start is not None or seg_end is not None:
-                    temp_path = temp_dir / f"seg_{i:04d}{seg_input.suffix}"
-                    cmd = ["ffmpeg", "-y", "-i", str(seg_input)]
-                    if seg_start is not None:
-                        cmd.extend(["-ss", str(seg_start)])
-                    if seg_end is not None:
-                        cmd.extend(["-to", str(seg_end)])
-                    cmd.extend(["-c", "copy", str(temp_path)])
-                    self.run_command(cmd)
-                    temp_files.append(temp_path)
-                else:
-                    temp_files.append(seg_input)
-
-            # Write concat file list
-            list_path = temp_dir / "concat_list.txt"
-            with open(list_path, "w", encoding="utf-8") as f:
-                for tf in temp_files:
-                    # FFmpeg concat demuxer needs forward slashes and escaped quotes
-                    safe_path = str(tf.resolve()).replace("\\", "/")
-                    f.write(f"file '{safe_path}'\n")
-
-            cmd = [
-                "ffmpeg", "-y",
-                "-f", "concat", "-safe", "0",
-                "-i", str(list_path),
-                "-c", "copy",
-                str(output_path),
-            ]
             self.run_command(cmd)
-
+        except Exception as e:
+            cleanup = _cleanup_temps()
             return ToolResult(
-                success=True,
+                success=False,
+                error=f"concat join failed: {e}",
                 data={
                     "operation": "concat",
                     "segment_count": len(segments),
                     "output": str(output_path),
+                    "final_output_created": False,
+                    **cleanup,
                 },
-                artifacts=[str(output_path)],
             )
-        finally:
-            # Clean up temp segment files (but not the originals)
-            for tf in temp_files:
-                if tf.parent == temp_dir and tf.exists():
-                    tf.unlink()
-            if list_path.exists():
-                list_path.unlink()
-            if temp_dir.exists():
-                try:
-                    temp_dir.rmdir()
-                except OSError:
-                    pass
+
+        cleanup = _cleanup_temps()
+        return ToolResult(
+            success=True,
+            data={
+                "operation": "concat",
+                "segment_count": len(segments),
+                "output": str(output_path),
+                **cleanup,
+            },
+            artifacts=[str(output_path)],
+        )
 
     @staticmethod
     def _build_atempo_chain(factor: float) -> str:

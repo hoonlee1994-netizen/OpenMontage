@@ -1049,3 +1049,501 @@ def test_cut_missing_input_still_fails():
         {"operation": "cut", "input_path": "/nonexistent/file.mp4"}
     )
     assert not result.success
+
+
+# ------------------------------------------------------------------
+# Concat segment-trim repair: one truthful trimming authority.
+#
+# Every concat segment carrying start_seconds/end_seconds is trimmed by
+# delegating to the hardened _cut contract (interval validation,
+# fail-closed probe, video keyframe-alignment gate, bounded
+# copy-duration semantics, required output streams). No independent
+# stream-copy path remains in _concat; a failed trim aborts the concat
+# before the final join with its segment index and trim context.
+# ------------------------------------------------------------------
+
+
+def _concat_tmp_dir(out: Path) -> Path:
+    return out.parent / ".concat_tmp"
+
+
+@needs_ffmpeg
+def test_concat_untrimmed_still_succeeds(tmp_path: Path, dense_av: Path):
+    """Repair point 1: ordinary untrimmed concat retains existing behavior."""
+    out = tmp_path / "plain_join.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [{"input_path": str(dense_av)}, {"input_path": str(dense_av)}],
+        }
+    )
+    assert result.success, result.error
+    assert out.is_file()
+    streams = _streams_of(out)
+    assert "video" in streams and "audio" in streams
+    assert result.data["segment_count"] == 2
+    assert not _concat_tmp_dir(out).exists()
+
+
+@needs_ffmpeg
+def test_concat_keyframe_aligned_trimmed_segment_succeeds(
+    tmp_path: Path, dense_av: Path
+):
+    """Repair point 2: keyframe-aligned trimmed video segment succeeds."""
+    out = tmp_path / "aligned_join.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {
+                    "input_path": str(dense_av),
+                    "start_seconds": 0,
+                    "end_seconds": 3,
+                },
+                {"input_path": str(dense_av)},
+            ],
+        }
+    )
+    assert result.success, result.error
+    assert out.is_file()
+    streams = _streams_of(out)
+    assert "video" in streams and "audio" in streams
+    assert not _concat_tmp_dir(out).exists()
+
+
+@needs_ffmpeg
+def test_concat_sparse_nonkeyframe_trim_fails_not_false_success(
+    tmp_path: Path, sparse_av: Path, dense_av: Path
+):
+    """Repair point 3: sparse/non-keyframe trim fails, never false-succeeds.
+
+    Pre-fix this exact concat reported success while the final output had
+    lost its video stream (audio-only) — the B1 contract bypass.
+    """
+    out = tmp_path / "sparse_join.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {
+                    "input_path": str(sparse_av),
+                    "start_seconds": 1.7,
+                    "end_seconds": 4.3,
+                },
+                {"input_path": str(dense_av)},
+            ],
+        }
+    )
+    assert not result.success
+    err = (result.error or "").lower()
+    assert "re-encode" in err and "libx264" in err
+    assert not out.exists(), "no partial final artifact may be presented"
+    assert result.data["failed_segment_index"] == 0
+
+
+@needs_ffmpeg
+def test_concat_zero_length_segment_fails(tmp_path: Path, dense_av: Path):
+    """Repair point 4: end == start fails via the cut interval contract."""
+    out = tmp_path / "zero_join.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {
+                    "input_path": str(dense_av),
+                    "start_seconds": 2,
+                    "end_seconds": 2,
+                }
+            ],
+        }
+    )
+    assert not result.success
+    err = (result.error or "").lower()
+    assert "end_seconds" in err and "greater than" in err
+    assert "no ffmpeg operation was executed" in err
+    assert not out.exists()
+    assert result.data["failed_segment_index"] == 0
+
+
+@needs_ffmpeg
+def test_concat_negative_length_segment_fails(tmp_path: Path, dense_av: Path):
+    """Repair point 5: end < start fails via the cut interval contract."""
+    out = tmp_path / "neg_join.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {
+                    "input_path": str(dense_av),
+                    "start_seconds": 3,
+                    "end_seconds": 2,
+                }
+            ],
+        }
+    )
+    assert not result.success
+    assert "greater than" in (result.error or "").lower()
+    assert result.data["trim_data"]["requested_duration"] == pytest.approx(-1.0)
+    assert not out.exists()
+    assert result.data["failed_segment_index"] == 0
+
+
+@needs_ffmpeg
+def test_concat_short_window_cannot_bypass_timing(
+    tmp_path: Path, dense_av: Path
+):
+    """Repair point 6: short-window copy segment obeys B1 timing semantics.
+
+    Dense 0-0.8 copy overshoots to ~1.03 s which exceeds the tight
+    min(0.30, 0.8*0.10)=0.08 s gate, so the segment — and the concat —
+    must fail rather than smuggle an overlong window into the join.
+    """
+    out = tmp_path / "short_join.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {
+                    "input_path": str(dense_av),
+                    "start_seconds": 0,
+                    "end_seconds": 0.8,
+                }
+            ],
+        }
+    )
+    assert not result.success
+    assert "libx264" in (result.error or "").lower()
+    assert not out.exists()
+    assert result.data["failed_segment_index"] == 0
+
+
+@needs_ffmpeg
+def test_concat_video_segment_without_proven_video_cannot_join(
+    tmp_path: Path, dense_av: Path, monkeypatch
+):
+    """Repair point 7: known-video segment needs proven video output.
+
+    Forces the _cut output probe to audio-only (the old silent video-drop
+    condition). The trim must fail and the failed segment must never enter
+    the concat list — the final FFmpeg join must never execute.
+    """
+    import tools.video.video_trimmer as vt_mod
+
+    real_probe = vt_mod.probe_codec_types
+
+    def fake_probe(path: Path):
+        if path.name.startswith("seg_"):
+            return {"audio"}  # simulated dropped-video trim output
+        return real_probe(path)
+
+    monkeypatch.setattr(vt_mod, "probe_codec_types", fake_probe)
+
+    real_run = VideoTrimmer.run_command
+    calls: list[list[str]] = []
+
+    def spy_run(self, cmd: list[str], **kwargs):
+        calls.append(list(cmd))
+        return real_run(self, cmd, **kwargs)
+
+    monkeypatch.setattr(VideoTrimmer, "run_command", spy_run)
+
+    out = tmp_path / "novideo_join.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {
+                    "input_path": str(dense_av),
+                    "start_seconds": 0,
+                    "end_seconds": 2,
+                }
+            ],
+        }
+    )
+    assert not result.success
+    assert "no video stream" in (result.error or "")
+    assert not out.exists()
+    assert result.data["failed_segment_index"] == 0
+    assert not any("concat" in c for c in calls), (
+        "failed trim must never reach the final join"
+    )
+
+
+@needs_ffmpeg
+def test_concat_audio_only_trimmed_segment_supported(
+    tmp_path: Path, audio_only: Path
+):
+    """Repair point 8: known-audio-only trimmed segment remains supported."""
+    out = tmp_path / "audio_join.m4a"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {
+                    "input_path": str(audio_only),
+                    "start_seconds": 0,
+                    "end_seconds": 2,
+                },
+                {"input_path": str(audio_only)},
+            ],
+        }
+    )
+    assert result.success, result.error
+    assert out.is_file()
+    streams = _streams_of(out)
+    assert "audio" in streams
+    assert "video" not in streams
+    actual = _independent_duration(out)
+    assert actual is not None
+    assert abs(actual - 6.0) <= 0.6
+
+
+@needs_ffmpeg
+def test_concat_unknown_probe_segment_fails_closed(
+    tmp_path: Path, dense_av: Path, monkeypatch
+):
+    """Repair point 9: unknown segment input probe fails closed."""
+    import tools.video.video_trimmer as vt_mod
+
+    real_probe = vt_mod.probe_codec_types
+
+    def fake_probe(path: Path):
+        if path.name == "mystery_seg.mp4":
+            return None
+        return real_probe(path)
+
+    monkeypatch.setattr(vt_mod, "probe_codec_types", fake_probe)
+
+    src = tmp_path / "mystery_seg.mp4"
+    shutil.copy(dense_av, src)
+    out = tmp_path / "mystery_join.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {
+                    "input_path": str(src),
+                    "start_seconds": 0,
+                    "end_seconds": 2,
+                }
+            ],
+        }
+    )
+    assert not result.success
+    assert "unknown" in (result.error or "").lower()
+    assert not out.exists()
+    assert result.data["failed_segment_index"] == 0
+    assert result.data["trim_data"]["input_probe"] == "unknown"
+
+
+@needs_ffmpeg
+def test_concat_failing_segment_reports_index_and_context(
+    tmp_path: Path, dense_av: Path, sparse_av: Path
+):
+    """Repair point 10: the failing segment index and trim context survive."""
+    out = tmp_path / "indexed_join.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {
+                    "input_path": str(dense_av),
+                    "start_seconds": 0,
+                    "end_seconds": 3,
+                },
+                {
+                    "input_path": str(sparse_av),
+                    "start_seconds": 1.7,
+                    "end_seconds": 4.3,
+                },
+            ],
+        }
+    )
+    assert not result.success
+    assert result.data["failed_segment_index"] == 1
+    assert result.data["segment_input"] == str(sparse_av)
+    assert "segment 1" in (result.error or "")
+    assert result.data["trim_error"], "underlying trim error must be preserved"
+    assert "keyframe" in (result.data["trim_error"] or "").lower()
+    assert result.data["trim_data"]["keyframe_aligned"] is False
+    assert not out.exists()
+
+
+@needs_ffmpeg
+def test_concat_later_segments_not_executed_after_trim_failure(
+    tmp_path: Path, sparse_av: Path, dense_av: Path, monkeypatch
+):
+    """Repair point 11: nothing after an earlier trim failure executes.
+
+    Segment 0 fails pre-FFmpeg (keyframe gate); segment 1 is a valid
+    trimmed segment that would run FFmpeg if the loop continued, and the
+    final join would also run FFmpeg. Zero FFmpeg calls must be observed.
+    """
+    real_run = VideoTrimmer.run_command
+    calls: list[list[str]] = []
+
+    def spy_run(self, cmd: list[str], **kwargs):
+        calls.append(list(cmd))
+        return real_run(self, cmd, **kwargs)
+
+    monkeypatch.setattr(VideoTrimmer, "run_command", spy_run)
+
+    out = tmp_path / "halted_join.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {
+                    "input_path": str(sparse_av),
+                    "start_seconds": 1.7,
+                    "end_seconds": 4.3,
+                },
+                {
+                    "input_path": str(dense_av),
+                    "start_seconds": 0,
+                    "end_seconds": 2,
+                },
+            ],
+        }
+    )
+    assert not result.success
+    assert result.data["failed_segment_index"] == 0
+    assert calls == [], f"no FFmpeg may run after trim failure, saw: {calls}"
+    assert not out.exists()
+
+
+@needs_ffmpeg
+def test_concat_temp_artifacts_cleaned_on_failure(
+    tmp_path: Path, dense_av: Path, sparse_av: Path
+):
+    """Repair point 12: failure cleans temp artifacts without touching inputs."""
+    out = tmp_path / "messy_join.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {
+                    "input_path": str(dense_av),
+                    "start_seconds": 0,
+                    "end_seconds": 3,
+                },
+                {
+                    "input_path": str(sparse_av),
+                    "start_seconds": 1.7,
+                    "end_seconds": 4.3,
+                },
+            ],
+        }
+    )
+    assert not result.success
+    # First segment's valid temp trim must also be cleaned on abort.
+    assert list(tmp_path.rglob("seg_*.mp4")) == []
+    assert list(tmp_path.rglob("concat_list.txt")) == []
+    assert not _concat_tmp_dir(out).exists()
+    assert result.data["cleanup_attempted"] is True
+    assert result.data["temp_dir_exists_after"] is False
+    assert not out.exists()
+    # Original inputs are never deleted.
+    assert dense_av.is_file() and sparse_av.is_file()
+
+
+@needs_ffmpeg
+def test_concat_trimmed_multi_segment_final_media_valid(
+    tmp_path: Path, dense_av: Path
+):
+    """Repair point 13: successful trimmed multi-segment concat is valid."""
+    out = tmp_path / "multi_join.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "concat",
+            "output_path": str(out),
+            "segments": [
+                {
+                    "input_path": str(dense_av),
+                    "start_seconds": 0,
+                    "end_seconds": 3,
+                },
+                {
+                    "input_path": str(dense_av),
+                    "start_seconds": 0.8,
+                    "end_seconds": 3.8,
+                },
+            ],
+        }
+    )
+    assert result.success, result.error
+    assert out.is_file()
+    streams = _streams_of(out)
+    assert "video" in streams and "audio" in streams
+    actual = _independent_duration(out)
+    assert actual is not None
+    assert abs(actual - 6.0) <= 0.6, f"joined duration drifted: {actual}s vs 6.0s"
+    assert not _concat_tmp_dir(out).exists()
+
+
+@needs_ffmpeg
+def test_cut_behavior_unchanged_by_concat_repair(
+    tmp_path: Path, dense_av: Path, sparse_av: Path
+):
+    """Repair point 14: existing cut behavior is unchanged."""
+    ok_out = tmp_path / "cut_still_ok.mp4"
+    ok_result = VideoTrimmer().execute(
+        {
+            "operation": "cut",
+            "input_path": str(dense_av),
+            "output_path": str(ok_out),
+            "start_seconds": 0,
+            "end_seconds": 3,
+            "codec": "copy",
+        }
+    )
+    assert ok_result.success, ok_result.error
+    assert "video" in _streams_of(ok_out)
+    assert ok_result.data["keyframe_aligned"] is True
+
+    bad_out = tmp_path / "cut_still_rejects.mp4"
+    bad_result = VideoTrimmer().execute(
+        {
+            "operation": "cut",
+            "input_path": str(sparse_av),
+            "output_path": str(bad_out),
+            "start_seconds": 1.7,
+            "end_seconds": 4.3,
+            "codec": "copy",
+        }
+    )
+    assert not bad_result.success
+    assert not bad_out.exists()
+    assert bad_result.data["keyframe_aligned"] is False
+
+
+@needs_ffmpeg
+def test_speed_behavior_unchanged_by_concat_repair(
+    tmp_path: Path, dense_av: Path
+):
+    """Repair point 15: speed behavior is unchanged."""
+    out = tmp_path / "still_fast.mp4"
+    result = VideoTrimmer().execute(
+        {
+            "operation": "speed",
+            "input_path": str(dense_av),
+            "output_path": str(out),
+            "speed_factor": 2.0,
+        }
+    )
+    assert result.success, result.error
+    streams = _streams_of(out)
+    assert "video" in streams and "audio" in streams
+    assert result.data["speed_factor"] == 2.0

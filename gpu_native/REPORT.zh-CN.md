@@ -3,7 +3,7 @@
 日期：2026-10-14　设备：Android 16 / ARM64 / MT6899（Mali-G720 MC8）/ Termux + PRoot Debian 12
 分支：`feat/gpu-native-openmontage`（仅本地提交，未推送）　证据目录：`gpu_native/bench/results/`
 
-> 结论先行：GPU/硬件优先已成为默认执行架构，并在真实 Mali GPU 与 MediaTek 硬件编码器上验证。主要生产路径（Remotion 渲染、全部 H.264/HEVC 编码、超分辨率、合成调度）均已迁移；剩余 CPU 工作负载均有实测或正确性依据。状态判定为 **PARTIAL**（理由见第 9 节）。
+> 结论先行：GPU/硬件优先已成为默认执行架构，并在真实 Mali GPU 与 MediaTek 硬件编码器上验证。主要生产路径（Remotion 渲染、全部 H.264/HEVC 编码、超分辨率、合成调度）均已迁移；剩余 CPU 工作负载均有实测或正确性依据。本次新增**免 proot 执行通道**（由 Termux 应用经服务 intent 派生 worker，**不需要 `allow-external-apps`、不改动任何 Android 设置**），在独占硬件编码上取得 **1.22×** 且输出**逐字节一致**；并行与流式作业实测无收益，故按独占门控启用。状态判定为 **PARTIAL**（理由见第 9 节）。
 
 ---
 
@@ -21,13 +21,17 @@ Debian / glibc（OpenMontage Python、Node、Remotion CLI）
  ├─ lib/gpu/ffmpeg_exec.py  PATH 上的 ffmpeg 分发器（gpu_native/shims/path/ffmpeg）
  │    └─ lib/gpu/ffmpeg_args.py  libx264/libx265 → h264/hevc_mediacodec 的语义保持翻译
  ├─ lib/gpu/remotion.py     Remotion：Mali 上的 Chromium + 硬件编码钩子 + GPU 进程监视
- └─ lib/gpu/superres.py     超分：ncnn/Vulkan Real-ESRGAN（Mali 计算）
+ ├─ lib/gpu/superres.py     超分：ncnn/Vulkan Real-ESRGAN（Mali 计算）
+ └─ lib/gpu/oop.py          免 proot worker 的客户端（仅用于独占编码的文件输出作业）
           │ 以 bionic 进程执行（仍在 proot 内）
+          │        └─ 由 Termux 应用派生（am startservice）─▶ worker/om_gpu_worker.py
+          │                                                  （bionic，TracerPid: 0）
           ▼
 $OM_GPU_HOME = /data/data/com.termux/files/home/.openmontage-gpu
  ├─ prefix/      Termux FFmpeg 8.1 依赖闭包（MediaCodec + Vulkan），$ORIGIN RUNPATH
  ├─ browser/     Termux Chromium 138 headless_shell 闭包（ANGLE → Android GLES 驱动）
  ├─ realesrgan/  ncnn Real-ESRGAN + 已批准模型的 ncnn 版本
+ ├─ run/         worker.sock / worker.ready（免 proot worker）
  ├─ bin/         omgpu-probe（平台证明探针）、零拷贝原型
  └─ state/       capabilities.json / chromium_gpu.json / health.json / exec.jsonl（执行日志）
 ```
@@ -42,6 +46,13 @@ $OM_GPU_HOME = /data/data/com.termux/files/home/.openmontage-gpu
 | 视频解码、FFmpeg 滤镜、调色、音频 | CPU（见第 7 节例外说明） | — |
 
 激活方式：导入 `tools` 包时调用 `lib.gpu.activate()`，仅对当前进程树把分发器放到 PATH 首位；不修改任何系统配置。`OM_GPU_MODE=cpu` 关闭，`OM_GPU_MODE=require` 禁止回退（验收用）。
+
+### 免 proot 执行通道（新增，有界优化）
+proot 会追踪其下**每个**进程，因此每次原生 FFmpeg 启动都要为 bionic 运行时的动态链接（83 个库）支付路径翻译开销：实测 `ffmpeg -version` 在被追踪时 1.42 s、不被追踪时 0.335 s。被追踪的进程**无法自行脱离**——PRoot 5.1 用 seccomp 过滤器（`Seccomp: 2`）在无追踪器时对被翻译的系统调用返回 `ENOSYS`，而 seccomp 过滤器只能叠加、不能移除。唯一的解是不经 proot 的进程来源：由 Termux **应用**派生的进程。
+
+因此新增 `lib/gpu/oop.py`：用 `am startservice com.termux.service.action.service_execute`（**服务 intent**，不是 `RUN_COMMAND`）让 TermuxService 派生 worker；worker 经 Unix socket 执行原生命令。**这不需要 `allow-external-apps`，不申请权限，不改动任何 Android 设置**（此前报告将其列为前置条件，本次实测证伪）。派生出的 worker `/proc/self/status` 为 `TracerPid: 0`，可见 `/dev/mali0`。
+
+该通道**有界**启用：应用派生的进程落在 Android `background` cpuset（仅 0–3 核，本机约慢 1.5×/核），故仅在作业**独占硬件编码器**时（`runtime.active_encoder_jobs("hwenc") == 0`）走 remote；任何失败都回退到原被追踪路径。
 
 ## 2. 实现（代码变更与集成的硬件后端）
 
@@ -60,7 +71,12 @@ $OM_GPU_HOME = /data/data/com.termux/files/home/.openmontage-gpu
 | `config.yaml` / `lib/config_model.py` | `gpu.mode: auto` |
 | `gpu_native/scripts/*` | 可复现引导：按 apt 索引 SHA256 校验抓取 Termux 包、`$ORIGIN` RUNPATH、去除 stub 库、编译原生组件；已从零在独立目录复现并验证 |
 | `gpu_native/src/omgpu_probe.c`、`om_binder_pool.c` | 平台证明探针；binder 线程池垫片 |
-| `tests/lib/test_gpu_*.py` | 新增 46 个测试用例（翻译契约、GOP/范围/CFR 语义、回退数据安全、Remotion 运行器决策），另在 `test_basicsr_torchvision_compat.py` 增加 1 个 |
+| `lib/gpu/oop.py` | 免 proot 客户端：从**活的 proot 命令行**推导 guest→host 路径映射（`--rootfs` 与全部 `--bind`，最长前缀匹配，含滤镜串内嵌路径），用服务 intent 派生并复用 worker，`warm()`/`ensure_worker()`/`run()`/`stop()`；任何失败返回 `None` 让调用方回退 |
+| `gpu_native/worker/om_gpu_worker.py` | bionic 侧常驻 worker（python3.13）：AF_UNIX + 长度前缀 JSON，线程化处理请求；客户端 socket 断开即杀掉子进程，避免孤儿占用编码会话槽 |
+| `lib/gpu/ffmpeg_exec.py`（改） | 新增 `_run_native_remote()`、`OOP_LAST` 遥测字段；文件输出作业按独占门控走 remote，流式路径强制本地；作业开始时非阻塞 `oop.warm()` |
+| `lib/gpu/runtime.py`（改） | 新增 `active_encoder_jobs()`：统计当前占用硬件编码会话槽数，用于独占判定 |
+| `lib/gpu/remotion.py`（改） | GPU 渲染开始前 `oop.warm()`，给 worker 预热留出渲染时长 |
+| `tests/lib/test_gpu_*.py` | 新增 46 个测试用例（翻译契约、GOP/范围/CFR 语义、回退数据安全、Remotion 运行器决策）+ `test_gpu_oop.py` 的 14 个（命名空间映射、worker 生命周期），另在 `test_basicsr_torchvision_compat.py` 增加 1 个 |
 
 为让硬件可用而解决的关键问题（均已在 README 记录）：
 - Termux `libandroid-stub` 的 stub `libmediandk.so` 使 MediaCodec 创建全部失败 → 从运行时移除。
@@ -77,6 +93,7 @@ $OM_GPU_HOME = /data/data/com.termux/files/home/.openmontage-gpu
 | GPU 计算（超分） | ncnn 进程：`[0 Mali-G720 MC8] queueC=0[2]…`，**持有 `/dev/mali0`**，映射 `/vendor/lib64/hw/mt6899/vulkan.mali.so`。 |
 | 设备本体 | Vulkan：`Mali-G720 MC8`，vendor 0x13b5，`INTEGRATED_GPU`，API 1.3.278，driverID 9（ARM proprietary），`v1.r49p1-03bet0`；EGL：`OpenGL ES 3.2 v1.r49p1…`，`/dev/mali0` 已打开。 |
 | 对照（Debian/glibc） | Debian 侧 ICD 仅 lavapipe/freedreno/broadcom/radeon；前次审计证实只得到 llvmpipe。 |
+| 免 proot 执行通道（新增） | 应用派生 worker 的 `/proc/<pid>/status`：`TracerPid: 0`（对比：proot 内任何进程 `TracerPid=<tracer>`）；父进程为 Termux 应用（uid 10382）；worker 内可见 `/dev/mali0` 且 guest `/root` 不存在，证明其运行在宿主命名空间。 |
 
 另有反向证据：CPU 时间核算显示 GPU 路径 Chromium CPU 时间下降约 5 倍，与 CPU 光栅化不一致；系统从不以设备名推断硬件。
 
@@ -94,14 +111,27 @@ $OM_GPU_HOME = /data/data/com.termux/files/home/.openmontage-gpu
 | 超分 480×270→1920×1080（RealESRGAN_x4plus） | 154.9 s（PyTorch，524 核·秒） | 21.1 s（41 核·秒） | **7.3×** |
 | 持续批量：6 个转码、3 并发、5400 帧 | 205.9 s，**26.3 fps** 聚合，1300 核·秒 | 58.5 s，**93.4 fps** 聚合，272 核·秒 | **3.55×**，0 失败 |
 
+**免 proot worker 的 A/B（`results/proot_free_ab.json`，交错运行、同负载、只改 `OM_GPU_OOP`，3 次取中位数）**：
+
+| 作业形态 | 被追踪（原路径） | 免 proot worker | 结果 |
+|---|---|---|---|
+| 独占 30 s 1080p 硬件编码 | 15.46 s | **12.67 s** | **1.22×**，省 2.79 s/次，输出**逐字节相同** |
+| 6 个编码、3 并发 | 53.54 s | 51.45 s | 1.04×（噪声内）——仅独占的那一个作业符合条件 |
+| Remotion 帧复用编码（`image2pipe`） | 146.5 s | 151.1 s | 0.97×（噪声）——worker 实际未被使用 |
+| Remotion 式 stdin 管道编码专用实验（300 帧 MJPEG→h264_mediacodec） | 3.40 s | 3.60 s | 0.95×——**无收益** |
+
+启动开销实测（`bench/oop_bench.py`）：原生 `ffmpeg -version` 被追踪 1.42 s vs 免 proot 0.335 s（每次启动省 ~1.09 s）；连续 5 次 7.09 s vs 1.75 s。独占编码的收益即来自“免去每次启动的动态链接路径翻译 + 编码期间的逐系统调用翻译”。
+
 开销与瓶颈：
 - proot 追踪器：约为 Chromium 自身 CPU 的 30%；每个原生 FFmpeg 启动 ~1.4 s（0.54 s 进程创建 + 加载 83 个库）。
+- worker 的 cpuset 惩罚：应用派生进程仅用 0–3 核（本机约慢 1.5×/核），这是“仅独占时启用”的直接原因，也是并行批次与流式管道无收益的原因。
 - 硬件编码器无 B 帧、码控较粗：同等或更高质量需 1.1–2.2× 码率（质量恒定，不是体积恒定）。
 - Remotion 每次渲染的 webpack 打包（20–50 s）仍在 CPU，两条路径相同。
 - Remotion 并发：GPU 路径实测 6 最好（4/5/8 在噪声范围内略差）。
 
 ## 5. 兼容性与正确性
 
+- **免 proot 输出逐字节一致**：worker 与被追踪路径对同一命令产出 **sha256 完全相同**的文件——独占单次编码 `bf7b46e8…`、stdin 管道实验 `c29af9af…`（四份全部相同）；帧数 900/300、分辨率 1920×1080 一致。两条路径调用的是同一个硬件编码器与同一份参数，故不引入任何输出差异。
 - **编码质量**（`results/encoder_calibration.md`）：两个真实素材上 CQ 映射保证 VMAF ≥ libx264 同 CRF（CRF18→CQ98：96.25→96.51 / 99.00→99.23；CRF23→CQ90：93.65→95.88 / 97.04→98.86）。
 - **输出契约一致性矩阵**（`results/parity_matrix.json`，10 种工具命令形态，CPU vs GPU）：**全部 10 例帧数、起始时间、时长一致**；GPU 对 CPU 的 PSNR 45–50 dB（最小 ≥43.4 dB）。差异仅为色彩范围标签：未标注 vs `tv`（数据同为有限范围）；调色例中 CPU 路径实际输出 **yuv444p（High 4:4:4）** —— 这是原有 CPU 路径的兼容性缺陷（多数浏览器/手机无法解码），GPU 路径输出 4:2:0 并正确标注。
 - 验证中发现并修复的语义差异（若不修复会破坏冻结要求）：
@@ -118,6 +148,7 @@ $OM_GPU_HOME = /data/data/com.termux/files/home/.openmontage-gpu
 
 - **无人值守混合队列**（2 个工作者，真实工具）：3 个 Remotion 渲染、4 个 compose、图像与视频超分，共 9 个任务 → **9/9 成功、9/9 输出校验通过**，302 s；其间对一个正在进行的硬件编码进程发送 **SIGKILL**，分发器检测到 `exit -9` 并对该片段原样重跑 CPU 命令，任务仍产出有效成片。
 - GPU 渲染中途退化检测：强制 GPU 进程失败时，watcher 识别 `--use-gl=disabled` 并在 CPU 路径重渲染，不会把 CPU 结果标为 GPU。
+- **免 proot worker 的隔离与无孤儿**：本次 A/B 共 18 条记录、**0 次超时**；累计 40+ 次硬件编码（混合被追踪与 worker 路径）无卡死。worker 在线程里监视客户端 socket，连接断开即杀掉自己已启动的子进程——恰好消除了此前观察到的“编码进程在父进程被杀后卡在 binder/futex、占住会话槽”的孤儿失败模式（另见第 8 节说明）。
 - 超出硬件能力（8K 编码）→ 自动回退 libx264，输出正确。
 - 数据安全：回退只删除失败尝试本身创建/改写的文件；已存在且未被改动的用户文件不动（单测覆盖）；未修改任何源素材。
 - 熔断与会话槽：连续 GPU 专属失败会暂时跳过该后端；硬件编码会话有跨进程上限，批量任务排队而不是在 configure 时失败。
@@ -138,23 +169,25 @@ $OM_GPU_HOME = /data/data/com.termux/files/home/.openmontage-gpu
 
 ## 8. 局限（未夸大）
 
-1. **proot 开销仍在**：bionic 进程由 proot 内启动，仍被追踪（Chromium CPU 的 ~30%、每次原生 FFmpeg 启动 ~1.4 s）。在 proot 外运行需启用 Termux `allow-external-apps`（RUN_COMMAND）——属于 Termux 应用级配置变更，**需单独授权**，本次未做。
+1. **proot 开销只在“独占的文件输出编码”上被消除**：新增的免 proot 通道需由 Termux 应用派生进程，而应用派生进程落在 Android `background` cpuset（仅 0–3 核，本机约慢 1.5×/核），因此**仅在作业独占硬件编码器时启用**（实测 1.22×）。并行批次（1.04×）与 Remotion 帧复用 / `stdin` 管道编码（0.95–0.97×）无收益：前者多个编码共享 0–3 核抵消了追踪开销，后者分发器自身必须（在被追踪状态下）转发管道，收益被 cpuset 惩罚抵消。把 worker 提到大核需要 `am start` 拉起 Termux 活动——被后台启动限制拒绝，属 Android 状态变更，本次未做。**注意：本通道用服务 intent（`startservice`），实测不需要 `allow-external-apps`，也未申请任何权限或改动 Android 设置**（此前报告把该开关列为前置条件，本次已证伪）。
 2. **HyperFrames 未安装**：其编码会自动经 PATH 分发器走硬件，但其浏览器 GPU 化未能验证。
 3. **Chromium 版本差**：GPU 浏览器为 Termux Chromium 138（Debian 为 153）。已在内置组合上验证；依赖 138 之后新 Web 特性的 atelier 组合可能渲染不同（失败会回退，但静默的视觉差异无法自动发现）。
 4. **码率代价**：同等质量硬件编码码率 1.1–2.2×；有体积上限的导出应显式给 `-b:v`。
 5. **调色 GPU 化未完成**（见第 7 节）。
-6. **测量条件**：共享设备、其他代理同时运行；结果为单/双次运行，连续负载最长约 10 分钟级，未做数小时热稳定性测试。
-7. **运行时位置**：`/data/data/com.termux/files/home/.openmontage-gpu` 不在 NO_DELETE 受保护列表中（我未修改该策略文件）；建议用户将其加入。
-8. 引导依赖本机 Termux apt 索引快照中的包版本；镜像下架旧版本时需刷新索引。
+6. **测量条件**：共享设备、其他代理会话同时运行，单次运行波动很大（同一 Remotion 渲染 77–161 s，同一被追踪编码 11–42 s）；因此本次 A/B 采用**交错 + 中位数**，只对稳定的差值下结论。Remotion 作业的墙钟差异经查**不是**本改动所致——其帧编码是 `image2pipe` stdin 管道，worker 未被使用（遥测 `oop` 缺失）。连续负载最长约 10 分钟级，未做数小时热稳定性测试。
+7. **一次未复现的卡死**：早前观察到一次**被追踪的**硬件编码在父进程被杀后卡在 `binder_thread_read`/`futex`（49 线程）并占住会话槽；随后 40+ 次编码（含被追踪与 worker 路径）均正常，未能归因于本次改动；worker 路径另有“客户端断开即杀子进程”的保护。
+8. **运行时位置**：`/data/data/com.termux/files/home/.openmontage-gpu` 不在 NO_DELETE 受保护列表中（我未修改该策略文件）；建议用户将其加入。
+9. 引导依赖本机 Termux apt 索引快照中的包版本；镜像下架旧版本时需刷新索引。
 
 ## 9. 状态：**PARTIAL**
 
-已完成并验证：GPU 优先为默认（A）、三类真实硬件执行证据（B）、CPU/GPU 对比与端到端结果（C）、功能/质量/同步兼容（D）、无人值守可靠性与故障注入（E）、CPU 例外逐项说明（F）。
-未闭合：调色的 GPU 等价实现（正确性阻碍）、HyperFrames 的 GPU 浏览器验证（未安装）、proot 外执行（需授权）。因此不报告为 COMPLETE。
+已完成并验证：GPU 优先为默认（A）、三类真实硬件执行证据（B）、CPU/GPU 对比与端到端结果（C）、功能/质量/同步兼容（D）、无人值守可靠性与故障注入（E）、CPU 例外逐项说明（F）；另新增**免 proot 执行通道**（服务 intent，不改 Android 设置），在独占硬件编码上取得 **1.22×**、输出**逐字节一致**（G）。
+未闭合：调色的 GPU 等价实现（正确性阻碍）、HyperFrames 的 GPU 浏览器验证（未安装）、proot 开销在并行批次与流式管道作业上的消除（受“应用派生进程只能用 0–3 核”的限制，需 Android 状态变更）。因此不报告为 COMPLETE。
 
 ## 10. 仓库状态、测试与复现
 
 - 分支 `feat/gpu-native-openmontage`；提交与 diff：`git log c135813..HEAD`、`git diff c135813..HEAD --stat`。
-- 测试：新增 `tests/lib/test_gpu_ffmpeg_args.py`、`test_gpu_dispatch_safety.py`、`test_gpu_remotion_runner.py`；回归结果见第 5 节；运行方式：`.venv/bin/python -m pytest -q tests/tools tests/contracts tests/lib`。
-- 复现：`bash gpu_native/scripts/bootstrap_runtime.sh && bash gpu_native/scripts/bootstrap_browser.sh`；证据：`python gpu_native/tools/collect_evidence.py <dir>`；基准：`gpu_native/bench/final_suite.py`、`parity_matrix.py`、`soak.py`。
+- 测试：新增 `tests/lib/test_gpu_ffmpeg_args.py`、`test_gpu_dispatch_safety.py`、`test_gpu_remotion_runner.py`、`test_gpu_oop.py`（命名空间映射与 worker 生命周期，14 项）；本次复跑 GPU 层 4 个文件共 **60 项全部通过**（`.venv/bin/python -m pytest -q tests/lib/test_gpu_oop.py tests/lib/test_gpu_ffmpeg_args.py tests/lib/test_gpu_dispatch_safety.py tests/lib/test_gpu_remotion_runner.py`）；全量回归结果见第 5 节。
+- 复现：`bash gpu_native/scripts/bootstrap_runtime.sh && bash gpu_native/scripts/bootstrap_browser.sh`；证据：`python gpu_native/tools/collect_evidence.py <dir>`；基准：`gpu_native/bench/final_suite.py`、`parity_matrix.py`、`soak.py`；免 proot A/B：`gpu_native/bench/oop_ab.py`（交错、中位数）与 `oop_bench.py`（每次启动开销），结果见 `results/proot_free_ab.json`。
+- 新增环境开关：`OM_GPU_OOP`（默认 `auto`；`0`/`off` 关闭）、`OM_GPU_OOP_WAIT_S`（默认 2.5）、`OM_GPU_OOP_TIMEOUT_S`（默认 3600）。所有开关只影响本工程的执行路径选择，不改变任何输出契约。
 - Develop Record：`DEVELOP_RECORD = REQUIRED`，但 openmontage 无受治理绑定（候选为无关项目）；按协议未创建项目/模块/Slice，**本次未写入开发记录**。

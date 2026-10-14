@@ -55,6 +55,9 @@ _SHIM_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path
 
 BACKEND = "mediacodec-encoder"
 
+# Whether the last native run went through the PRoot-free worker (telemetry).
+OOP_LAST = False
+
 
 def real_ffmpeg() -> str:
     """The Debian (CPU) ffmpeg, skipping our own shim directory on PATH."""
@@ -211,7 +214,39 @@ def _set_pdeathsig() -> None:
         pass
 
 
-def _run_native(cmd: list[str], *, capture_stderr: bool) -> tuple[int, bytes]:
+def _run_native_remote(cmd: list[str], *, capture_stderr: bool) -> "tuple[int, bytes] | None":
+    """Run the native command in the PRoot-free worker, or None to fall back.
+
+    PRoot traces every native FFmpeg launch, and its path translation of the
+    bionic runtime's dynamic linking is pure overhead (measured ~1.0 s per
+    launch; see gpu_native/bench/oop_bench.py). The worker is an app-spawned
+    process on the other side of PRoot (``lib.gpu.oop``), so the encode runs
+    untraced. Any failure — worker down, bad path map, timeout — returns None
+    and the caller runs the command under PRoot exactly as before.
+    """
+    global OOP_LAST
+    from lib.gpu import oop
+
+    r = oop.run(cmd, cwd=os.getcwd(), env=runtime.native_env(),
+                timeout=float(os.environ.get("OM_GPU_OOP_TIMEOUT_S", "3600")),
+                wait_s=float(os.environ.get("OM_GPU_OOP_WAIT_S", "2.5")))
+    if r is None or r.error:
+        return None
+    OOP_LAST = True
+    if r.stdout:
+        try:
+            sys.stdout.buffer.write(r.stdout)
+            sys.stdout.buffer.flush()
+        except (AttributeError, ValueError, OSError):
+            pass
+    return r.rc, r.stderr or b""
+
+
+def _run_native(cmd: list[str], *, capture_stderr: bool, allow_remote: bool = True) -> tuple[int, bytes]:
+    if allow_remote:
+        remote = _run_native_remote(cmd, capture_stderr=capture_stderr)
+        if remote is not None:
+            return remote
     proc = subprocess.Popen(
         cmd, env=runtime.native_env(), stdin=None, stdout=None,
         stderr=subprocess.PIPE if capture_stderr else None,
@@ -268,6 +303,22 @@ def dispatch(argv: list[str]) -> int:
     gpu_plans = [p for p in plans if p.action == "gpu"]
     codec = gpu_plans[0].hw_codec
     enc = runtime.hw_encoder(codec) or {}
+    # The PRoot-free worker (lib.gpu.oop) runs in Android's `background`
+    # cpuset — cores 0-3 only, ~1.5x slower per core here — so it is only
+    # worth using for a job that is alone on the encoder: then PRoot's tracing
+    # overhead (measured ~4.4 s on a 30 s 1080p hardware encode) dominates.
+    # With several encodes in flight the two effects cancel, so we stay traced.
+    try:
+        solo = runtime.active_encoder_jobs("hwenc") == 0
+    except Exception:
+        solo = False
+    if solo:
+        try:
+            from lib.gpu import oop
+
+            oop.warm()  # never blocks; gives the worker the rest of the job as lead time
+        except Exception:
+            pass
     native_cmd = [str(runtime.native_ffmpeg()), *gpu_argv]
     streaming = ffmpeg_args.reads_stdin(argv) or ffmpeg_args.writes_stdout(argv)
     backend_healthy = runtime.healthy(BACKEND)
@@ -291,7 +342,7 @@ def dispatch(argv: list[str]) -> int:
 
         if streaming:
             # Cannot replay a consumed pipe: run on hardware, no fallback.
-            rc, _ = _run_native(native_cmd, capture_stderr=False)
+            rc, _ = _run_native(native_cmd, capture_stderr=False, allow_remote=False)
             runtime.record_outcome(BACKEND, rc == 0, f"exit {rc}")
             telemetry.record({"kind": "job", "op": "ffmpeg", "backend": "gpu" if rc == 0 else "gpu-failed",
                               "encoder": f"{codec}_mediacodec", "device": enc.get("component"),
@@ -301,7 +352,7 @@ def dispatch(argv: list[str]) -> int:
 
         file_outputs = [p.target for p in gpu_plans if not ffmpeg_args.is_pipe(p.target)]
         before = _snapshot(file_outputs)
-        rc, err = _run_native(native_cmd, capture_stderr=True)
+        rc, err = _run_native(native_cmd, capture_stderr=True, allow_remote=solo)
         problem = f"native ffmpeg exit {rc}" if rc != 0 else _validate(
             [p.target for p in gpu_plans if not ffmpeg_args.is_pipe(p.target)])
 
@@ -311,6 +362,7 @@ def dispatch(argv: list[str]) -> int:
         sys.stderr.flush()
         telemetry.record({"kind": "job", "op": "ffmpeg", "backend": "gpu",
                           "encoder": f"{codec}_mediacodec", "device": enc.get("component"),
+                          "oop": OOP_LAST,
                           "rc": 0, "wall_s": round(time.time() - t0, 3),
                           "output": ",".join(p.target for p in gpu_plans)})
         return 0

@@ -258,6 +258,15 @@ def run_render(base_cmd: list[str], *, cwd: Path, timeout: Optional[int], runner
         cmd = with_flags(base_cmd, render_flags(gpu=True))
         render_id = f"{os.getpid()}-{time.time_ns()}"
         try:
+            # Bring the proot-free encode worker up now: the render's frames
+            # take tens of seconds, so by the time Remotion calls the FFmpeg
+            # hook the worker is live and the final encode skips PRoot.
+            from lib.gpu import oop
+
+            oop.warm()
+        except Exception:
+            pass
+        try:
             # Child processes (npx -> node -> Chromium -> GPU process) inherit
             # OM_RENDER_ID, which ties the observed GPU processes to this render.
             with _env_lock:

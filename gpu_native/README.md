@@ -32,16 +32,51 @@ Debian / glibc (OpenMontage Python, Node, Remotion)
  ├─ lib/gpu/ffmpeg_exec.py  PATH "ffmpeg" dispatcher (gpu_native/shims/path/ffmpeg)
  │    └─ lib/gpu/ffmpeg_args.py  translate libx264/libx265 -> h264/hevc_mediacodec
  ├─ lib/gpu/remotion.py     GPU Chromium + hardware-encoder hook for Remotion renders
- └─ lib/gpu/superres.py     ncnn/Vulkan Real-ESRGAN backend for the upscale tool
+ ├─ lib/gpu/superres.py     ncnn/Vulkan Real-ESRGAN backend for the upscale tool
+ └─ lib/gpu/oop.py          client for the PRoot-free worker (file-output encodes)
           │  exec (bionic processes, still under proot)
+          │        └─ app-spawn (am startservice) ─▶ worker/om_gpu_worker.py
+          │                                             (bionic, TracerPid 0)
           ▼
 $OM_GPU_HOME (/data/data/com.termux/files/home/.openmontage-gpu)
  ├─ prefix/      Termux FFmpeg 8.1 closure (MediaCodec + Vulkan), $ORIGIN RUNPATHs
  ├─ browser/     Termux Chromium 138 headless_shell closure (ANGLE)
  ├─ realesrgan/  ncnn Real-ESRGAN + approved models
  ├─ bin/         omgpu-probe (+ prototypes)
+ ├─ run/         worker.sock / worker.ready (PRoot-free worker)
  └─ state/       capabilities.json, chromium_gpu.json, health.json, exec.jsonl
 ```
+
+### PRoot-free execution (bounded, measured)
+
+Every process inside PRoot is traced, so each native FFmpeg launch pays for the
+tracer's path translation of the bionic runtime's dynamic linking (83
+libraries) — measured **1.42 s vs 0.335 s** for `ffmpeg -version`. A traced
+process cannot detach itself: PRoot 5.1's seccomp filter (`Seccomp: 2`)
+answers `ENOSYS` to the translated syscalls once no tracer is attached, and
+seccomp filters only stack. The only PRoot-free source is a process the Termux
+*app* forks, so `lib/gpu/oop.py` starts the worker with
+`am startservice com.termux.service.action.service_execute` — a service intent,
+**not** `RUN_COMMAND`, so it needs no `allow-external-apps`, no permission and
+no Android setting change. The worker then runs native commands over a Unix
+socket; any failure falls back to the in-PRoot path unchanged.
+
+Measured win (interleaved A/B, `bench/results/proot_free_ab.json`):
+
+| Shape | Traced | Worker | Result |
+|---|---|---|---|
+| Standalone 30 s 1080p hardware encode | 15.46 s | **12.67 s** | **1.22×**, output byte-identical |
+| 6 encodes, 3 parallel | 53.54 s | 51.45 s | neutral — only the solo shot is eligible |
+| Remotion frame-mux encode (`image2pipe`) | 146.5 s | 151.1 s | noise; path stays traced (see below) |
+
+The app-spawned worker lands in Android's **`background` cpuset** (cores 0–3,
+the little cluster; ~1.5× slower per core here), and `am start` of the activity
+is refused by background-start limits. So remote execution is **gated to a job
+that is alone on the hardware encoder** (`runtime.active_encoder_jobs("hwenc")
+== 0`), where PRoot's overhead dominates; with several encodes in flight the two
+effects cancel and the traced path is kept. A Remotion-style `stdin` pipe is
+also left traced: the shim would itself have to pump the pipe (traced) and the
+worker's cpuset penalty offsets the saving — measured 0.95×, no gain.
 
 ### Why it is built this way (all measured on this device)
 
@@ -89,6 +124,10 @@ $OM_GPU_HOME (/data/data/com.termux/files/home/.openmontage-gpu)
   path, so colour grading stays on CPU for correctness.
 * **Debian Chromium + virgl/Venus bridge**: not pursued; the bionic Chromium
   reaches the vendor driver directly.
+* **PRoot-free execution everywhere** (`lib/gpu/oop.py`): works and is used for
+  solo file-output encodes, but the worker's `background` cpuset (cores 0–3)
+  makes it a wash for parallel batches (1.04×) and for `stdin`-pipe encodes
+  (0.95×), so it is deliberately gated, not applied globally.
 
 ## Policy and fallback
 
@@ -106,7 +145,12 @@ $OM_GPU_HOME (/data/data/com.termux/files/home/.openmontage-gpu)
   breaker). Hardware encoder sessions are bounded by cross-process slots.
 * Every routed job is logged with the backend that actually ran it:
   `$OM_GPU_HOME/state/exec.jsonl`; tools also return
-  `ToolResult.data["gpu_execution"]`.
+  `ToolResult.data["gpu_execution"]`. GPU jobs record `"oop": true` when the
+  PRoot-free worker ran them.
+* The PRoot-free worker is opt-out (`OM_GPU_OOP=0`) and never a dependency: a
+  missing worker, a bad namespace map or a timeout returns to the traced path.
+  When the worker's client socket closes it kills its own child, so an
+  interrupted job cannot leave an orphan holding a codec slot.
 
 ## Install / rebuild
 

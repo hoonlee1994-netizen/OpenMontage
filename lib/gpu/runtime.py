@@ -361,6 +361,39 @@ def codec_slot(kind: str, slots: int, *, wait_s: float = 600.0) -> Iterator[Opti
             fh.close()
 
 
+def active_encoder_jobs(kind: str = "hwenc", slots: "int | None" = None) -> int:
+    """How many hardware-encoder slots are held right now (including ours).
+
+    Used to decide whether the PRoot-free worker is worth using: it runs in
+    Android's ``background`` cpuset (cores 0-3 only, ~1.5x slower per core on
+    this device), which cancels PRoot's tracing overhead once several encodes
+    share those cores. A job that is alone on the encoder is always better off
+    untraced.
+    """
+    if slots is None:
+        try:
+            slots = int(os.environ.get("OM_GPU_ENCODER_SLOTS") or
+                        min(4, int((hw_encoder("h264") or {}).get("max_instances") or 4)))
+        except ValueError:
+            slots = 4
+    lock_dir = state_dir() / "slots"
+    busy = 0
+    for i in range(max(1, slots)):
+        p = lock_dir / f"{kind}.{i}"
+        if not p.exists():
+            continue
+        try:
+            with open(p, "a+") as fh:
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(fh, fcntl.LOCK_UN)
+                except BlockingIOError:
+                    busy += 1
+        except OSError:
+            continue
+    return busy
+
+
 def media_parallelism() -> int:
     """Concurrent media jobs to schedule for independent encode work.
 

@@ -1,0 +1,274 @@
+{
+ "generated_at": "2026-10-14T15:58:12+0000",
+ "device": "Android 16 / ARM64 / MT6899 (Mali-G720 MC8) / Termux + PRoot Debian 12",
+ "method": "interleaved A/B, same workload, only OM_GPU_OOP differs; medians over 3 reps",
+ "ab_summary": {
+  "batch_6_jobs_par3": {
+   "n": 6,
+   "traced_median_s": 53.54,
+   "worker_median_s": 51.45,
+   "speedup": 1.041,
+   "saved_s": 2.09
+  },
+  "remotion_render_1080p690f": {
+   "n": 6,
+   "traced_median_s": 146.49,
+   "worker_median_s": 151.13,
+   "speedup": 0.969,
+   "saved_s": -4.64
+  },
+  "single_30s_1080p_hwenc": {
+   "n": 6,
+   "traced_median_s": 15.46,
+   "worker_median_s": 12.67,
+   "speedup": 1.22,
+   "saved_s": 2.79
+  }
+ },
+ "ab_records": [
+  {
+   "workload": "single_30s_1080p_hwenc",
+   "rep": 0,
+   "oop": "0",
+   "wall_s": 15.46,
+   "rc": 0,
+   "timed_out": false,
+   "frames": 900,
+   "telemetry_oop": false,
+   "backend": "gpu"
+  },
+  {
+   "workload": "single_30s_1080p_hwenc",
+   "rep": 0,
+   "oop": "auto",
+   "wall_s": 12.57,
+   "rc": 0,
+   "timed_out": false,
+   "frames": 900,
+   "telemetry_oop": true,
+   "backend": "gpu"
+  },
+  {
+   "workload": "single_30s_1080p_hwenc",
+   "rep": 1,
+   "oop": "auto",
+   "wall_s": 12.67,
+   "rc": 0,
+   "timed_out": false,
+   "frames": 900,
+   "telemetry_oop": true,
+   "backend": "gpu"
+  },
+  {
+   "workload": "single_30s_1080p_hwenc",
+   "rep": 1,
+   "oop": "0",
+   "wall_s": 13.55,
+   "rc": 0,
+   "timed_out": false,
+   "frames": 900,
+   "telemetry_oop": false,
+   "backend": "gpu"
+  },
+  {
+   "workload": "single_30s_1080p_hwenc",
+   "rep": 2,
+   "oop": "0",
+   "wall_s": 16.52,
+   "rc": 0,
+   "timed_out": false,
+   "frames": 900,
+   "telemetry_oop": false,
+   "backend": "gpu"
+  },
+  {
+   "workload": "single_30s_1080p_hwenc",
+   "rep": 2,
+   "oop": "auto",
+   "wall_s": 12.76,
+   "rc": 0,
+   "timed_out": false,
+   "frames": 900,
+   "telemetry_oop": true,
+   "backend": "gpu"
+  },
+  {
+   "workload": "batch_6_jobs_par3",
+   "rep": 0,
+   "oop": "0",
+   "wall_s": 50.5,
+   "rc": 0,
+   "timed_out": false,
+   "aggregate_fps": 107.9,
+   "total_frames": 5400,
+   "shots_using_worker": 0,
+   "shots": 6
+  },
+  {
+   "workload": "batch_6_jobs_par3",
+   "rep": 0,
+   "oop": "auto",
+   "wall_s": 46.5,
+   "rc": 0,
+   "timed_out": false,
+   "aggregate_fps": 117.3,
+   "total_frames": 5400,
+   "shots_using_worker": 1,
+   "shots": 6
+  },
+  {
+   "workload": "batch_6_jobs_par3",
+   "rep": 1,
+   "oop": "0",
+   "wall_s": 53.54,
+   "rc": 0,
+   "timed_out": false,
+   "aggregate_fps": 101.7,
+   "total_frames": 5400,
+   "shots_using_worker": 0,
+   "shots": 6
+  },
+  {
+   "workload": "batch_6_jobs_par3",
+   "rep": 1,
+   "oop": "auto",
+   "wall_s": 54.83,
+   "rc": 0,
+   "timed_out": false,
+   "aggregate_fps": 99.3,
+   "total_frames": 5400,
+   "shots_using_worker": 1,
+   "shots": 6
+  },
+  {
+   "workload": "batch_6_jobs_par3",
+   "rep": 2,
+   "oop": "0",
+   "wall_s": 57.59,
+   "rc": 0,
+   "timed_out": false,
+   "aggregate_fps": 94.4,
+   "total_frames": 5400,
+   "shots_using_worker": 0,
+   "shots": 6
+  },
+  {
+   "workload": "batch_6_jobs_par3",
+   "rep": 2,
+   "oop": "auto",
+   "wall_s": 51.45,
+   "rc": 0,
+   "timed_out": false,
+   "aggregate_fps": 105.9,
+   "total_frames": 5400,
+   "shots_using_worker": 1,
+   "shots": 6
+  },
+  {
+   "workload": "remotion_render_1080p690f",
+   "rep": 0,
+   "oop": "0",
+   "wall_s": 146.49,
+   "rc": 0,
+   "timed_out": false,
+   "success": true,
+   "gpu_execution": "gpu",
+   "encode_shots": 1,
+   "shots_using_worker": 0,
+   "frames": 690
+  },
+  {
+   "workload": "remotion_render_1080p690f",
+   "rep": 0,
+   "oop": "auto",
+   "wall_s": 78.37,
+   "rc": 0,
+   "timed_out": false,
+   "success": true,
+   "gpu_execution": "gpu",
+   "encode_shots": 1,
+   "shots_using_worker": 0,
+   "frames": 690
+  },
+  {
+   "workload": "remotion_render_1080p690f",
+   "rep": 1,
+   "oop": "0",
+   "wall_s": 144.17,
+   "rc": 0,
+   "timed_out": false,
+   "success": true,
+   "gpu_execution": "gpu",
+   "encode_shots": 1,
+   "shots_using_worker": 0,
+   "frames": 690
+  },
+  {
+   "workload": "remotion_render_1080p690f",
+   "rep": 1,
+   "oop": "auto",
+   "wall_s": 162.92,
+   "rc": 0,
+   "timed_out": false,
+   "success": true,
+   "gpu_execution": "gpu",
+   "encode_shots": 1,
+   "shots_using_worker": 0,
+   "frames": 690
+  },
+  {
+   "workload": "remotion_render_1080p690f",
+   "rep": 2,
+   "oop": "0",
+   "wall_s": 157.02,
+   "rc": 0,
+   "timed_out": false,
+   "success": true,
+   "gpu_execution": "gpu",
+   "encode_shots": 1,
+   "shots_using_worker": 0,
+   "frames": 690
+  },
+  {
+   "workload": "remotion_render_1080p690f",
+   "rep": 2,
+   "oop": "auto",
+   "wall_s": 151.13,
+   "rc": 0,
+   "timed_out": false,
+   "success": true,
+   "gpu_execution": "gpu",
+   "encode_shots": 1,
+   "shots_using_worker": 0,
+   "frames": 690
+  }
+ ],
+ "streaming_stdin_pipe_experiment": {
+  "note": "Remotion-style image2pipe encode (300 frames 1080p MJPEG -> h264_mediacodec); traced vs worker, median of 3, interleaved",
+  "traced_median_s": 3.4,
+  "worker_median_s": 3.6,
+  "speedup": 0.946,
+  "interpretation": "no gain: the traced shim must itself pump stdin through the socket, and the worker runs in Android's background cpuset (cores 0-3); the two cancel PRoot's tracing saving, so the streaming path stays on the traced route"
+ },
+ "launch_overhead": {
+  "note": "native bionic 'ffmpeg -version'; measured earlier with gpu_native/bench/oop_bench.py",
+  "traced_s": 1.42,
+  "worker_s": 0.335,
+  "saved_per_launch_s": 1.085,
+  "sequential_5_traced_s": 7.09,
+  "sequential_5_worker_s": 1.75
+ },
+ "output_parity_sha256": {
+  "single_traced": "bf7b46e8e7b95e2c39682831a48d1e8036d474e8df53bcf3cfa58aab57c942e6",
+  "single_worker": "bf7b46e8e7b95e2c39682831a48d1e8036d474e8df53bcf3cfa58aab57c942e6",
+  "stream_traced": "c29af9afe0b4cde5555d2be92aa62f0531708add9ea7020f3b1f888ab6046f69",
+  "stream_worker": "c29af9afe0b4cde5555d2be92aa62f0531708add9ea7020f3b1f888ab6046f69",
+  "single_identical": true,
+  "stream_identical": true
+ },
+ "reliability": {
+  "ab_timeouts": 0,
+  "ab_records": 18,
+  "hang_note": "one in-PRoot hardware encode stalled after the harness killed its parent (pre-existing binder thread state); not reproduced across 40+ subsequent encodes; the worker additionally kills its child when the client socket closes, which removes that orphan failure mode."
+ }
+}

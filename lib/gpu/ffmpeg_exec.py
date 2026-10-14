@@ -146,6 +146,42 @@ def _remove_partial(paths: list, before: dict) -> None:
                 pass
 
 
+def _reference_semantics(ffmpeg_path: str) -> str:
+    """'legacy' for a reference FFmpeg < 7, else 'modern' (see ffmpeg_args.translate).
+
+    Cached per binary (path + mtime) in the runtime state directory.
+    """
+    _load()
+    try:
+        st = os.stat(ffmpeg_path)
+    except OSError:
+        return "legacy"
+    key = f"{ffmpeg_path}:{st.st_mtime_ns}"
+    cache = runtime.state_dir() / "ffmpeg_versions.json"
+    try:
+        known = json.loads(cache.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        known = {}
+    major = known.get(key)
+    if major is None:
+        try:
+            out = subprocess.run([ffmpeg_path, "-hide_banner", "-version"], capture_output=True, text=True,
+                                 timeout=30, env=_cpu_env()).stdout
+            ver = out.split()[2] if out.startswith("ffmpeg version") else ""
+            digits = "".join(ch for ch in ver.lstrip("n").split(".")[0] if ch.isdigit())
+            major = int(digits) if digits else 0
+        except Exception:
+            major = 0
+        known[key] = major
+        try:
+            tmp = cache.with_suffix(f".tmp.{os.getpid()}")
+            tmp.write_text(json.dumps(known), encoding="utf-8")
+            tmp.replace(cache)
+        except OSError:
+            pass
+    return "modern" if major >= 7 else "legacy"
+
+
 def _probe_fps(path: str):
     """Frame rate of the first video stream of ``path`` (for GOP checks)."""
     try:
@@ -215,7 +251,8 @@ def dispatch(argv: list[str]) -> int:
     if gpu_argv is not None:
         caps = runtime.capabilities()
         available = set((caps.get("hw_encoders") or {}).keys()) if caps.get("ok") else set()
-        gpu_argv, plans = ffmpeg_args.translate(argv, available=available, probe_fps=_probe_fps)
+        gpu_argv, plans = ffmpeg_args.translate(argv, available=available, probe_fps=_probe_fps,
+                                                reference=_reference_semantics(cpu_cmd[0]))
     if gpu_argv is None:
         reasons = sorted({p.reason for p in plans if p.action == "cpu"})
         if reasons:

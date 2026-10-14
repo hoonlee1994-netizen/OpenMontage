@@ -58,6 +58,9 @@ _SUPPORTED_PIX = {None, "yuv420p", "yuvj420p", "nv12"}
 _H264_PROFILES = {"baseline", "main", "high"}
 _HEVC_PROFILES = {"main"}
 
+# Muxers FFmpeg < 7 drives in constant-frame-rate mode by default.
+_LEGACY_CFR_CONTAINERS = {"mp4", "mov", "m4v", "3gp", "3g2", "ipod", "ismv", "psp"}
+
 HW_ENCODER_FOR = {"libx264": "h264", "h264": "h264", "libx265": "hevc", "hevc": "hevc"}
 
 
@@ -340,11 +343,22 @@ CQ_TABLE: dict = {
 DEFAULT_CRF = {"h264": 23.0, "hevc": 28.0}  # libx264 / libx265 defaults
 
 
-def translate(argv: list[str], *, available: set[str], probe_fps=None) -> tuple["list[str] | None", list[OutputPlan]]:
+def translate(argv: list[str], *, available: set[str], probe_fps=None,
+              reference: str = "legacy") -> tuple["list[str] | None", list[OutputPlan]]:
     """Return (gpu_argv, plans). ``gpu_argv`` is None when nothing is translated.
 
     ``available`` is the set of verified hardware codecs (``{"h264", "hevc"}``).
     Only output segments are edited; inputs and globals are untouched.
+
+    ``reference`` names the CPU FFmpeg being replaced, whose semantics the
+    native 8.1 build must reproduce: "legacy" for FFmpeg < 7 (Debian 5.1),
+    "modern" for >= 7 (e.g. Remotion's 7.1). FFmpeg < 7 differs in two
+    output-contract ways that matter here:
+      * ``-pix_fmt yuv420p`` converts to limited range (>= 7 keeps the
+        source range) -> explicit ``-color_range tv``;
+      * MOV/MP4 output defaults to constant frame rate, duplicating/dropping
+        to fill the timeline (>= 7 passes variable timing through)
+        -> explicit ``-fps_mode cfr``.
     """
     parsed = parse(argv)
     if not parsed.ok:
@@ -379,14 +393,21 @@ def translate(argv: list[str], *, available: set[str], probe_fps=None) -> tuple[
                 continue  # re-emitted below from the effective GOP request
             if k in ("-profile:v", "-profile"):
                 has_profile = True
-            if k in ("-pix_fmt", "-pix_fmt:v") and v == "yuvj420p":
-                # The hardware encoder takes limited-range 4:2:0; FFmpeg's
-                # scaler converts the range, so the output stays correctly
-                # tagged (tv range) and visually equivalent.
-                v = "yuv420p"
+            if k in ("-pix_fmt", "-pix_fmt:v"):
+                if v == "yuvj420p":
+                    # Full-range 4:2:0: same data, expressed as a range tag.
+                    v = "yuv420p"
+                    if not _has(seg.opts, "-color_range"):
+                        new_opts.extend(["-color_range", "pc"])
+                elif v in ("yuv420p", "nv12") and reference == "legacy" \
+                        and not _has(seg.opts, "-color_range"):
+                    new_opts.extend(["-color_range", "tv"])
             new_opts.append(k)
             if v is not None:
                 new_opts.append(v)
+        if reference == "legacy" and (_container(seg) or "").lower() in _LEGACY_CFR_CONTAINERS \
+                and not any(_has(seg.opts, k) for k in ("-vsync", "-fps_mode", "-fps_mode:v")):
+            new_opts.extend(["-fps_mode", "cfr"])
         enc = [f"-c:v", f"{hw}_mediacodec"]
         if explicit_bitrate:
             enc += ["-bitrate_mode", "vbr"]

@@ -456,8 +456,20 @@ class ToolRegistry:
                         f"{entry.get('name')}: {entry.get('resource_profile_note')}"
                     )
 
+        # GPU-native execution: which genuine hardware backends are active by
+        # default (verified on this device), and what still runs on CPU.
+        try:
+            from lib.gpu import runtime as gpu_runtime
+
+            gpu_info = gpu_runtime.summary()
+            if gpu_info.get("mode") != "cpu" and not gpu_info.get("ok"):
+                runtime_warnings.append(f"gpu: {gpu_info.get('error')}")
+        except Exception as exc:  # preflight must not break on GPU probing
+            gpu_info = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
         result = {
             "composition_runtimes": comp_runtimes,
+            "gpu_runtime": gpu_info,
             "capabilities": capabilities,
             "setup_offers": setup_offers,
             "runtime_warnings": runtime_warnings,

@@ -67,6 +67,8 @@ Each tool's `agent_skills[]` field bridges Layer 1 → Layer 3. See `skills/INDE
 | `lib/media_profiles.py` | Platform-specific render profiles |
 | `styles/playbook_loader.py` | Style playbook loader + validator + design intelligence (color/type/a11y) |
 | `tools/base_tool.py` | ToolContract base class |
+| `lib/gpu/` | GPU-native execution layer: hardware probe/policy (`runtime.py`), GPU-first ffmpeg dispatch (`ffmpeg_exec.py`, `ffmpeg_args.py`), Remotion on Mali Chromium (`remotion.py`), ncnn/Vulkan super-resolution (`superres.py`) |
+| `gpu_native/` | Bionic runtime bootstrap (Termux FFmpeg/Chromium closures, native tools), shims, benchmarks — see `gpu_native/README.md` |
 | `tools/tool_registry.py` | Tool discovery and reporting |
 | `tools/cost_tracker.py` | Budget governance |
 | `tools/video/video_stitch.py` | Multi-clip assembly (stitch, spatial, validate, preview) |

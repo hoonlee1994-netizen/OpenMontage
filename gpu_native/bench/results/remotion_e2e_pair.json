@@ -1,0 +1,59 @@
+[
+  {
+    "cmd": [
+      ".venv/bin/python",
+      "gpu_native/bench/e2e_remotion.py",
+      "remotion-composer/public/demo-props/world-in-numbers.json",
+      "/tmp/claude-0/-root-projects-openmontage/16281f80-c812-4b56-9176-f0120c37fc70/scratchpad/final/remotion_cpu_long.mp4"
+    ],
+    "rc": 0,
+    "wall_s": 399.12,
+    "cpu_core_s": 1661.1,
+    "avg_busy_cores": 4.16,
+    "by_process": {
+      "chromium": 994.9,
+      "linker64": 344.1,
+      "python3": 155.5,
+      "claude": 54.7,
+      "ffmpeg": 54.6,
+      "grok": 33.0,
+      "node": 18.8,
+      "npm exec remoti": 1.9,
+      "opencode": 1.3,
+      "git": 0.8,
+      "python": 0.6,
+      "2.1.296": 0.5,
+      "bash": 0.4
+    },
+    "mode": "cpu",
+    "note": "back-to-back pair, same device load; python3 = sampler overhead"
+  },
+  {
+    "cmd": [
+      ".venv/bin/python",
+      "gpu_native/bench/e2e_remotion.py",
+      "remotion-composer/public/demo-props/world-in-numbers.json",
+      "/tmp/claude-0/-root-projects-openmontage/16281f80-c812-4b56-9176-f0120c37fc70/scratchpad/final/remotion_gpu_pair.mp4"
+    ],
+    "rc": 0,
+    "wall_s": 86.87,
+    "cpu_core_s": 280.7,
+    "avg_busy_cores": 3.23,
+    "by_process": {
+      "exe": 91.0,
+      "linker64": 80.8,
+      "python3": 32.4,
+      "headless_shell": 27.3,
+      "node": 14.1,
+      "claude": 13.5,
+      "binder:22394_4": 9.1,
+      "grok": 6.4,
+      "python": 2.8,
+      "npm exec remoti": 2.0,
+      "ffmpeg": 0.9,
+      "opencode": 0.4
+    },
+    "mode": "gpu",
+    "note": "back-to-back pair, same device load; python3 = sampler overhead"
+  }
+]

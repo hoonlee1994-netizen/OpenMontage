@@ -1,0 +1,170 @@
+{
+  "collected_at": "2026-10-14T12:23:14+0000",
+  "omgpu_probe": {
+    "probe": "omgpu-probe",
+    "version": 1,
+    "mediacodec": [
+      {
+        "mime": "video/avc",
+        "role": "encoder",
+        "available": true,
+        "name": "c2.mtk.avc.encoder",
+        "type": "HARDWARE_ACCELERATED",
+        "vendor": true,
+        "max_instances": 10,
+        "canonical_name": "c2.mtk.avc.encoder"
+      },
+      {
+        "mime": "video/avc",
+        "role": "decoder",
+        "available": true,
+        "name": "c2.mtk.avc.decoder",
+        "type": "HARDWARE_ACCELERATED",
+        "vendor": true,
+        "max_instances": 15,
+        "canonical_name": "c2.mtk.avc.decoder"
+      },
+      {
+        "mime": "video/hevc",
+        "role": "encoder",
+        "available": true,
+        "name": "c2.mtk.hevc.encoder",
+        "type": "HARDWARE_ACCELERATED",
+        "vendor": true,
+        "max_instances": 10,
+        "canonical_name": "c2.mtk.hevc.encoder"
+      },
+      {
+        "mime": "video/hevc",
+        "role": "decoder",
+        "available": true,
+        "name": "c2.mtk.hevc.decoder",
+        "type": "HARDWARE_ACCELERATED",
+        "vendor": true,
+        "max_instances": 15,
+        "canonical_name": "c2.mtk.hevc.decoder"
+      },
+      {
+        "mime": "video/x-vnd.on2.vp9",
+        "role": "encoder",
+        "available": false
+      },
+      {
+        "mime": "video/x-vnd.on2.vp9",
+        "role": "decoder",
+        "available": true,
+        "name": "c2.mtk.vp9.decoder",
+        "type": "HARDWARE_ACCELERATED",
+        "vendor": true,
+        "max_instances": 15,
+        "canonical_name": "c2.mtk.vp9.decoder"
+      },
+      {
+        "mime": "video/av01",
+        "role": "encoder",
+        "available": true,
+        "name": "c2.android.av1.encoder",
+        "type": "SOFTWARE_ONLY",
+        "vendor": false,
+        "max_instances": 32,
+        "canonical_name": "c2.android.av1.encoder"
+      },
+      {
+        "mime": "video/av01",
+        "role": "decoder",
+        "available": true,
+        "name": "c2.mtk.av1.decoder",
+        "type": "HARDWARE_ACCELERATED",
+        "vendor": true,
+        "max_instances": 15,
+        "canonical_name": "c2.mtk.av1.decoder"
+      }
+    ],
+    "vulkan": {
+      "available": true,
+      "devices": [
+        {
+          "name": "Mali-G720 MC8",
+          "vendor_id": 5045,
+          "device_id": 3362783248,
+          "type": 1,
+          "api": "1.3.278",
+          "driver_id": 9,
+          "driver_name": "Mali-G720 MC8",
+          "driver_info": "v1.r49p1-03bet0.4fc328bba6e40f10f4bc96d62f5ee40a",
+          "timestamp_period_ns": 76.92308
+        }
+      ],
+      "device_created": true,
+      "dev_mali0_fd": true,
+      "vendor_driver_mapped": true
+    },
+    "egl": {
+      "available": true,
+      "egl_version": "1.5",
+      "gl_vendor": "ARM",
+      "gl_renderer": "Mali-G720 MC8",
+      "gl_version": "OpenGL ES 3.2 v1.r49p1-03bet0.4fc328bba6e40f10f4bc96d62f5ee40a",
+      "dev_mali0_fd": true,
+      "vendor_driver_mapped": true
+    }
+  },
+  "mediacodec_encoder_runtime_log": [
+    "MediaCodec encoder c2.mtk.avc.encoder"
+  ],
+  "remotion_render_require_mode": "{\n \"mode\": \"require\",\n \"success\": true,\n \"wall_s\": 95.11,\n \"error\": \"\",\n \"gpu_execution\": {\n  \"backend\": \"gpu\",\n  \"renderer\": \"ANGLE (ARM, Mali-G720 MC8, OpenGL ES 3.2)\",\n  \"wall_s\": 94.54,\n  \"attempts\": [],\n  \"gpu_processes\": [\n   [\n    \"--use-angle=gles-egl\",\n    \"--use-gl=angle\"\n   ]\n  ]\n }\n}\n",
+  "chromium_gpu_processes": [
+    {
+      "pid": "13938",
+      "cmdline": [
+        "/proc/self/exe",
+        "--type=gpu-process",
+        "--use-angle=gles-egl",
+        "--use-gl=angle"
+      ],
+      "vendor_gpu_libs_mapped": [
+        "(deleted)",
+        "/dev/mali0",
+        "/system/lib64/libvulkan.so",
+        "/vendor/lib64/egl/mt6899/libGLES_mali.so",
+        "/vendor/lib64/hw/mt6899/vulkan.mali.so",
+        "/vendor/lib64/mt6899/arm.mali.platform-V2-ndk.so"
+      ],
+      "dev_mali0_open": true
+    }
+  ],
+  "superres_run": {
+    "backend": "gpu",
+    "device": "Mali-G720 MC8",
+    "engine": "ncnn-vulkan",
+    "model": "realesrgan-x4plus",
+    "wall_s": 31.461
+  },
+  "superres_processes": [
+    {
+      "pid": "14535",
+      "cmdline": [
+        "/data/data/com.termux/files/home/.openmontage-gpu/realesrgan/bin/realesrgan-ncnn-vulkan",
+        "/tmp/claude-0/-root-projects-openmontage/16281f80-c812-4b56-9176-f0120c37fc70/scratchpad/evidence/evidence_sr_in.png",
+        "/tmp/claude-0/-root-projects-openmontage/16281f80-c812-4b56-9176-f0120c37fc70/scratchpad/evidence/evidence_sr_out.png",
+        "/data/data/com.termux/files/home/.openmontage-gpu/realesrgan/models"
+      ],
+      "vendor_gpu_libs_mapped": [
+        "(deleted)",
+        "/dev/mali0",
+        "/system/lib64/libvulkan.so",
+        "/vendor/lib64/egl/mt6899/libGLES_mali.so",
+        "/vendor/lib64/hw/mt6899/vulkan.mali.so",
+        "/vendor/lib64/mt6899/arm.mali.platform-V2-ndk.so"
+      ],
+      "dev_mali0_open": true
+    }
+  ],
+  "debian_glibc_vulkan": "loaded <CDLL 'libvulkan.so.1', handle c60840 at 0x7a534f6b90> (see prior audit: llvmpipe only)",
+  "debian_vulkan_icds": [
+    "broadcom_icd.aarch64.json",
+    "freedreno_icd.aarch64.json",
+    "lvp_icd.aarch64.json",
+    "radeon_icd.aarch64.json"
+  ]
+}

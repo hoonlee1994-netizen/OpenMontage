@@ -1,0 +1,282 @@
+[
+  {
+    "case": "compose_segment_30fps",
+    "cpu": {
+      "rc": 0,
+      "frames": 165,
+      "v_start": 0.0,
+      "a_start": 0.0,
+      "size": "1920x1080",
+      "pix_fmt": "yuv420p",
+      "range": "tv",
+      "duration": 5.5
+    },
+    "require": {
+      "rc": 0,
+      "frames": 165,
+      "v_start": 0.0,
+      "a_start": 0.0,
+      "size": "1920x1080",
+      "pix_fmt": "yuv420p",
+      "range": "tv",
+      "duration": 5.5
+    },
+    "contract_equal": true,
+    "psnr_gpu_vs_cpu": {
+      "avg": "49.999782",
+      "min": "47.960665"
+    }
+  },
+  {
+    "case": "compose_segment_24fps_portrait",
+    "cpu": {
+      "rc": 0,
+      "frames": 150,
+      "v_start": 0.0,
+      "a_start": 0.0,
+      "size": "1920x1080",
+      "pix_fmt": "yuv420p",
+      "range": "tv",
+      "duration": 5.0
+    },
+    "require": {
+      "rc": 0,
+      "frames": 150,
+      "v_start": 0.0,
+      "a_start": 0.0,
+      "size": "1920x1080",
+      "pix_fmt": "yuv420p",
+      "range": "tv",
+      "duration": 5.0
+    },
+    "contract_equal": true,
+    "psnr_gpu_vs_cpu": {
+      "avg": "48.304825",
+      "min": "47.153564"
+    }
+  },
+  {
+    "case": "compose_segment_speed_1_25",
+    "cpu": {
+      "rc": 0,
+      "frames": 146,
+      "v_start": 0.0,
+      "a_start": 0.0,
+      "size": "1920x1080",
+      "pix_fmt": "yuv420p",
+      "range": "tv",
+      "duration": 4.867
+    },
+    "require": {
+      "rc": 0,
+      "frames": 146,
+      "v_start": 0.0,
+      "a_start": 0.0,
+      "size": "1920x1080",
+      "pix_fmt": "yuv420p",
+      "range": "tv",
+      "duration": 4.867
+    },
+    "contract_equal": true,
+    "psnr_gpu_vs_cpu": {
+      "avg": "50.233517",
+      "min": "48.540562"
+    }
+  },
+  {
+    "case": "subtitle_burn",
+    "cpu": {
+      "rc": 0,
+      "frames": 150,
+      "v_start": 0.0,
+      "a_start": 0.0,
+      "size": "1920x1080",
+      "pix_fmt": "yuvj420p",
+      "range": "pc",
+      "duration": 5.014
+    },
+    "require": {
+      "rc": 0,
+      "frames": 150,
+      "v_start": 0.0,
+      "a_start": 0.0,
+      "size": "1920x1080",
+      "pix_fmt": "yuvj420p",
+      "range": "pc",
+      "duration": 5.014
+    },
+    "contract_equal": true,
+    "psnr_gpu_vs_cpu": {
+      "avg": "45.776011",
+      "min": "44.328342"
+    }
+  },
+  {
+    "case": "vfr_source_to_mp4",
+    "cpu": {
+      "rc": 0,
+      "frames": 119,
+      "v_start": 0.0,
+      "a_start": null,
+      "size": "1280x720",
+      "pix_fmt": "yuv420p",
+      "range": null,
+      "duration": 3.967
+    },
+    "require": {
+      "rc": 0,
+      "frames": 119,
+      "v_start": 0.0,
+      "a_start": null,
+      "size": "1280x720",
+      "pix_fmt": "yuv420p",
+      "range": "tv",
+      "duration": 3.967
+    },
+    "contract_equal": false,
+    "psnr_gpu_vs_cpu": {
+      "avg": "45.285969",
+      "min": "43.435814"
+    }
+  },
+  {
+    "case": "color_grade",
+    "cpu": {
+      "rc": 0,
+      "frames": 120,
+      "v_start": 0.0,
+      "a_start": 0.0,
+      "size": "1920x1080",
+      "pix_fmt": "yuv444p",
+      "range": null,
+      "duration": 4.011
+    },
+    "require": {
+      "rc": 0,
+      "frames": 120,
+      "v_start": 0.0,
+      "a_start": 0.0,
+      "size": "1920x1080",
+      "pix_fmt": "yuvj420p",
+      "range": "pc",
+      "duration": 4.011
+    },
+    "contract_equal": false,
+    "psnr_gpu_vs_cpu": {
+      "avg": "45.796616",
+      "min": "44.831620"
+    }
+  },
+  {
+    "case": "overlay_image",
+    "cpu": {
+      "rc": 0,
+      "frames": 120,
+      "v_start": 0.0,
+      "a_start": 0.0,
+      "size": "1920x1080",
+      "pix_fmt": "yuvj420p",
+      "range": "pc",
+      "duration": 4.011
+    },
+    "require": {
+      "rc": 0,
+      "frames": 120,
+      "v_start": 0.0,
+      "a_start": 0.0,
+      "size": "1920x1080",
+      "pix_fmt": "yuvj420p",
+      "range": "pc",
+      "duration": 4.011
+    },
+    "contract_equal": true,
+    "psnr_gpu_vs_cpu": {
+      "avg": "45.133130",
+      "min": "43.995674"
+    }
+  },
+  {
+    "case": "image_sequence_reassembly",
+    "cpu": {
+      "rc": 0,
+      "frames": 60,
+      "v_start": 0.0,
+      "a_start": 0.0,
+      "size": "960x540",
+      "pix_fmt": "yuv420p",
+      "range": null,
+      "duration": 2.006
+    },
+    "require": {
+      "rc": 0,
+      "frames": 60,
+      "v_start": 0.0,
+      "a_start": 0.0,
+      "size": "960x540",
+      "pix_fmt": "yuv420p",
+      "range": "tv",
+      "duration": 2.0
+    },
+    "contract_equal": false,
+    "psnr_gpu_vs_cpu": {
+      "avg": "46.095055",
+      "min": "44.694867"
+    }
+  },
+  {
+    "case": "trim_reencode",
+    "cpu": {
+      "rc": 0,
+      "frames": 126,
+      "v_start": 0.0,
+      "a_start": 0.0,
+      "size": "1920x1080",
+      "pix_fmt": "yuvj420p",
+      "range": "pc",
+      "duration": 4.2
+    },
+    "require": {
+      "rc": 0,
+      "frames": 126,
+      "v_start": 0.0,
+      "a_start": 0.0,
+      "size": "1920x1080",
+      "pix_fmt": "yuvj420p",
+      "range": "pc",
+      "duration": 4.2
+    },
+    "contract_equal": true,
+    "psnr_gpu_vs_cpu": {
+      "avg": "48.247149",
+      "min": "45.919583"
+    }
+  },
+  {
+    "case": "reframe_vertical",
+    "cpu": {
+      "rc": 0,
+      "frames": 120,
+      "v_start": 0.0,
+      "a_start": 0.0,
+      "size": "1080x1920",
+      "pix_fmt": "yuvj420p",
+      "range": "pc",
+      "duration": 4.011
+    },
+    "require": {
+      "rc": 0,
+      "frames": 120,
+      "v_start": 0.0,
+      "a_start": 0.0,
+      "size": "1080x1920",
+      "pix_fmt": "yuvj420p",
+      "range": "pc",
+      "duration": 4.011
+    },
+    "contract_equal": true,
+    "psnr_gpu_vs_cpu": {
+      "avg": "48.224074",
+      "min": "47.313126"
+    }
+  }
+]

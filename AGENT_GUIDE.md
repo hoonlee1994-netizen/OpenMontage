@@ -279,6 +279,7 @@ The summary returns four fields the agent should translate into plain language:
 - `capabilities[]` — one entry per capability family with `configured / total` counts and provider lists. Ready-made for the "N of M configured" menu.
 - `setup_offers[]` — unavailable tools whose install is a 1-minute env-var fix. Lead with these when offering upgrades.
 - `runtime_warnings[]` — specific signals like "hyperframes: npm package not resolvable". Surface these to the user verbatim — they're the kind of silent-failure bugs that break the governance contract.
+- `gpu_runtime` — GPU-native execution status (see `gpu_native/README.md`): verified hardware (Mali GPU, MediaTek hardware encoders) and the `routing` table of which workloads run on GPU vs CPU by default. GPU-first is automatic (`OM_GPU_MODE=auto`); tell the user in one line what will run on hardware, and report `ToolResult.data["gpu_execution"]` (backend actually used, fallback reason) in render reports. Never describe a `cpu` or `gpu-degraded` execution as GPU.
 
 Then, for deeper inspection (only when the summary isn't enough):
 

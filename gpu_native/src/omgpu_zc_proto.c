@@ -42,7 +42,7 @@ static void start_binder_pool(void) {
     void *h = dlopen("libbinder_ndk.so", RTLD_NOW);
     bool (*set_max)(uint32_t) = h ? (bool (*)(uint32_t))dlsym(h, "ABinderProcess_setThreadPoolMaxThreadCount") : NULL;
     void (*start)(void) = h ? (void (*)(void))dlsym(h, "ABinderProcess_startThreadPool") : NULL;
-    if (set_max) set_max(2);
+    if (set_max) set_max(getenv("ZC_BINDER") ? atoi(getenv("ZC_BINDER")) : 2);
     if (start) start();
 }
 
@@ -158,6 +158,8 @@ int main(int argc, char **argv) {
     EGLSurface surf = eglCreateWindowSurface(dpy, cfg, (EGLNativeWindowType)encWin, NULL);
     if (surf == EGL_NO_SURFACE) DIE("eglCreateWindowSurface 0x%x", eglGetError());
     eglMakeCurrent(dpy, surf, surf, ctx);
+    /* Offline transcode: never throttle buffer submission to a display rate. */
+    if (!getenv("ZC_SWAP1")) eglSwapInterval(dpy, 0);
     fprintf(stderr, "GL_RENDERER=%s\n", glGetString(GL_RENDERER));
     GLuint prog = glCreateProgram();
     glAttachShader(prog, compile(GL_VERTEX_SHADER, VS));
@@ -179,6 +181,23 @@ int main(int argc, char **argv) {
     glUniform4f(glGetUniformLocation(prog, "rect"), rx0, ry0, rx1, ry1);
     glViewport(0, 0, W, H);
 
+    if (getenv("ZC_MODE") && !strcmp(getenv("ZC_MODE"), "enc")) {
+        int ofd2 = open(out, O_CREAT | O_TRUNC | O_RDWR, 0644);
+        g_mux = AMediaMuxer_new(ofd2, AMEDIAMUXER_OUTPUT_FORMAT_MPEG_4); g_enc = enc;
+        pthread_t th; pthread_create(&th, NULL, drain_encoder, NULL);
+        double ts0 = now();
+        for (int i = 0; i < 900; i++) {
+            glClearColor((i % 255) / 255.0f, 0.3f, 0.6f, 1); glClear(GL_COLOR_BUFFER_BIT);
+            eglPresentationTimeANDROID(dpy, surf, (EGLnsecsANDROID)i * 33333333LL);
+            eglSwapBuffers(dpy, surf);
+        }
+        AMediaCodec_signalEndOfInputStream(enc);
+        pthread_join(th, NULL);
+        double ts1 = now();
+        AMediaMuxer_stop(g_mux);
+        fprintf(stderr, "ENC-ONLY frames_out=%ld wall=%.2f fps=%.1f\n", g_frames_out, ts1 - ts0, g_frames_out / (ts1 - ts0));
+        fflush(stderr); _exit(0);
+    }
     /* Decoder -> ImageReader. */
     AImageReader *reader;
     if (AImageReader_newWithUsage(iw, ih, AIMAGE_FORMAT_PRIVATE, AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE, 4, &reader) != AMEDIA_OK)
@@ -203,6 +222,7 @@ int main(int argc, char **argv) {
     struct { AHardwareBuffer *hb; EGLImageKHR img; } cache[16]; int ncache = 0;
     double t0 = now();
     double last_dbg = now();
+    double t_decdq = 0, t_wait = 0, t_draw = 0, t_swap = 0;
     while (!dec_eos || frames_drawn < released) {
         if (getenv("ZC_DBG") && now() - last_dbg > 1.0) {
             last_dbg = now();
@@ -220,7 +240,9 @@ int main(int argc, char **argv) {
         }
         if (!dec_eos && released - frames_drawn < 3) {
             AMediaCodecBufferInfo info;
+            double tq = now();
             ssize_t ob = AMediaCodec_dequeueOutputBuffer(dec, &info, 1000);
+            t_decdq += now() - tq;
             if (ob >= 0) {
                 bool render = info.size > 0;
                 AMediaCodec_releaseOutputBuffer(dec, ob, render);
@@ -228,20 +250,24 @@ int main(int argc, char **argv) {
                 if (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) dec_eos = true;
             }
         }
-        /* Draw every image that has arrived. */
+        /* Draw every image that has arrived (acquire until the queue is empty). */
         for (;;) {
-            pthread_mutex_lock(&mu);
-            int ready = images_ready;
-            if (ready == 0 && (released > frames_drawn) && (dec_eos || released - frames_drawn >= 3)) {
-                struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_nsec += 50000000;
+            AImage *img = NULL;
+            double ta = now();
+            media_status_t st = AImageReader_acquireNextImage(reader, &img);
+            if (st != AMEDIA_OK) {
+                bool need = released > frames_drawn && (dec_eos || released - frames_drawn >= 3);
+                if (!need) break;
+                pthread_mutex_lock(&mu);
+                struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_nsec += 5000000;
                 if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
-                pthread_cond_timedwait(&cv, &mu, &dl); ready = images_ready;
+                if (images_ready == 0) pthread_cond_timedwait(&cv, &mu, &dl);
+                images_ready = 0;
+                pthread_mutex_unlock(&mu);
+                t_wait += now() - ta;
+                continue;
             }
-            if (ready > 0) images_ready--;
-            pthread_mutex_unlock(&mu);
-            if (ready == 0) break;
-            AImage *img;
-            if (AImageReader_acquireNextImage(reader, &img) != AMEDIA_OK) break;
+            if (getenv("ZC_MODE") && !strcmp(getenv("ZC_MODE"), "dec")) { AImage_delete(img); frames_drawn++; continue; }
             int64_t ts; AImage_getTimestamp(img, &ts);
             AHardwareBuffer *hb; AImage_getHardwareBuffer(img, &hb);
             EGLImageKHR ei = EGL_NO_IMAGE_KHR;
@@ -251,15 +277,20 @@ int main(int argc, char **argv) {
                 ei = eglCreateImageKHR(dpy, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, eglGetNativeClientBufferANDROID(hb), ia);
                 if (ncache < 16) { cache[ncache].hb = hb; cache[ncache].img = ei; ncache++; }
             }
+            double td = now();
             glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, (GLeglImageOES)ei);
             glClear(GL_COLOR_BUFFER_BIT);
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
             eglPresentationTimeANDROID(dpy, surf, (EGLnsecsANDROID)ts);
+            double tsw = now();
             eglSwapBuffers(dpy, surf);
+            t_swap += now() - tsw;
+            t_draw += tsw - td;
             AImage_delete(img);
             frames_drawn++;
         }
     }
+    fprintf(stderr, "stage seconds: dec_dequeue=%.2f wait_image=%.2f draw=%.2f swap=%.2f\n", t_decdq, t_wait, t_draw, t_swap);
     AMediaCodec_signalEndOfInputStream(enc);
     pthread_join(drain_thr, NULL);
     long frames_out = g_frames_out;

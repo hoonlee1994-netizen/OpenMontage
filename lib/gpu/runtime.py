@@ -118,6 +118,11 @@ def native_env(extra: Optional[dict[str, str]] = None) -> dict[str, str]:
     # text matches the CPU path.
     if Path("/etc/fonts/fonts.conf").exists():
         env.setdefault("FONTCONFIG_FILE", "/etc/fonts/fonts.conf")
+        # Debian's fonts.conf includes conf.d by *relative* path; without
+        # FONTCONFIG_PATH the native fontconfig resolves it against the Termux
+        # prefix, loses every alias rule and libass picks different fonts
+        # (e.g. Arial -> DejaVu Serif instead of Liberation Sans).
+        env.setdefault("FONTCONFIG_PATH", "/etc/fonts")
     if extra:
         env.update(extra)
     return env
@@ -398,4 +403,23 @@ def summary() -> dict[str, Any]:
     gl = caps.get("gles") or {}
     out["gles_renderer"] = gl.get("renderer") if gl.get("verified") else None
     out["chromium_gpu_installed"] = (caps.get("chromium_gpu") or {}).get("installed")
+    try:
+        browser = json.loads((state_dir() / "chromium_gpu.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        browser = {}
+    out["chromium_gpu_verified_renderer"] = (browser.get("webgl") or {}).get("renderer") if browser.get("ok") else None
+    superres_ok = (home() / "realesrgan" / "models" / "realesrgan-x4plus.param").is_file()
+    enc = "hardware encoder " + ", ".join(out["hardware_video_encoders"].values()) if out["hardware_video_encoders"] else "CPU (no verified hardware encoder)"
+    out["routing"] = {
+        "h264/hevc video encode (all tools, Remotion, HyperFrames)": enc,
+        "remotion frame rasterisation": (
+            f"GPU: {out['chromium_gpu_verified_renderer']}" if out["chromium_gpu_verified_renderer"]
+            else "GPU browser installed; verified on first render" if out["chromium_gpu_installed"]
+            else "CPU (SwiftShader) - GPU browser not installed"),
+        "super-resolution (RealESRGAN_x4plus, x4plus_anime_6B)": (
+            f"GPU: ncnn/Vulkan on {out['vulkan_device']}" if superres_ok and out["vulkan_device"] else "CPU (PyTorch)"),
+        "video decode": "CPU (multithreaded; measured faster than the hardware decoder path on this device)",
+        "FFmpeg filters (scale/pad/subtitles/colour grade)": "CPU (FFmpeg Vulkan upload/download costs more than these filters; see gpu_native/README.md)",
+        "independent compose segments": f"parallel x{media_parallelism()}",
+    }
     return out

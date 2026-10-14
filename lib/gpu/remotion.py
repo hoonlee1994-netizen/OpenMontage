@@ -18,6 +18,7 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -85,11 +86,15 @@ def verify_browser(*, refresh: bool = False) -> dict[str, Any]:
     cache = runtime.state_dir() / "chromium_gpu.json"
     launcher = runtime.chromium_launcher()
     exe = runtime.chromium_executable()
-    digest = f"{exe.stat().st_mtime_ns if exe.exists() else 0}:{launcher.stat().st_mtime_ns if launcher.exists() else 0}"
+    digest = (f"{exe.stat().st_mtime_ns if exe.exists() else 0}:"
+              f"{launcher.stat().st_mtime_ns if launcher.exists() else 0}:"
+              f"{os.environ.get('OM_CHROMIUM_ANGLE', 'gles-egl')}")
     if not refresh and cache.exists():
         try:
             data = json.loads(cache.read_text(encoding="utf-8"))
-            if data.get("digest") == digest and time.time() - data.get("verified_at", 0) < _VERIFY_TTL_S:
+            # A failed verification is retried soon; a pass is trusted longer.
+            ttl = _VERIFY_TTL_S if data.get("ok") else 600
+            if data.get("digest") == digest and time.time() - data.get("verified_at", 0) < ttl:
                 return data
         except (OSError, json.JSONDecodeError):
             pass
@@ -130,8 +135,12 @@ def render_flags(*, gpu: bool) -> list[str]:
         bdir = binaries_dir()
         if bdir is not None:
             flags.append(f"--binaries-directory={bdir}")
-        conc = os.environ.get("OM_REMOTION_GPU_CONCURRENCY")
-        if conc:
+        # With rasterisation on the GPU the per-tab CPU cost drops ~5x, so
+        # more tabs overlap usefully (measured best at 6 of 8 cores; see
+        # gpu_native/bench). A caller's own --concurrency comes later on the
+        # command line and wins.
+        conc = os.environ.get("OM_REMOTION_GPU_CONCURRENCY", "6")
+        if conc and conc != "default":
             flags.append(f"--concurrency={conc}")
     else:
         browser = cpu_browser()
@@ -167,6 +176,73 @@ def plan() -> dict[str, Any]:
     return {"gpu": True, "renderer": (v.get("webgl") or {}).get("renderer")}
 
 
+class _GpuProcessWatch:
+    """Watch the GPU processes of one render (identified by OM_RENDER_ID).
+
+    If Chromium's Mali GPU process fails, Chromium relaunches it with
+    ``--use-gl=disabled`` (software compositing) or SwiftShader and keeps
+    rendering on the CPU. That shows up in the GPU process command line, which
+    this watcher records, so such a render is reported as degraded rather
+    than as GPU.
+    """
+
+    def __init__(self, render_id: str):
+        self.render_id = render_id.encode()
+        self.seen: dict[str, list[str]] = {}
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _scan(self) -> None:
+        for d in os.listdir("/proc"):
+            if not d.isdigit() or d in self.seen:
+                continue
+            try:
+                with open(f"/proc/{d}/cmdline", "rb") as fh:
+                    argv = fh.read().split(b"\0")
+                if not any(a == b"--type=gpu-process" for a in argv):
+                    continue
+                with open(f"/proc/{d}/environ", "rb") as fh:
+                    if b"OM_RENDER_ID=" + self.render_id not in fh.read().split(b"\0"):
+                        continue
+            except OSError:
+                continue
+            self.seen[d] = [a.decode("utf-8", "replace") for a in argv
+                            if a.startswith((b"--use-gl", b"--use-angle", b"--disable-gpu"))]
+
+    def _run(self) -> None:
+        while not self._stop.wait(0.5):
+            self._scan()
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        self._thread.join()
+        self._scan()
+
+    def verdict(self) -> tuple[str, list[str]]:
+        procs = list(self.seen.values())
+        software = [f for p in procs for f in p if f in ("--use-gl=disabled", "--disable-gpu")
+                    or "swiftshader" in f]
+        hardware = [p for p in procs if "--use-angle=gles-egl" in p and "--use-gl=angle" in p]
+        if software:
+            return "gpu-degraded", sorted(set(software))
+        if not hardware:
+            return "gpu-unverified", ["no Mali GPU process observed for this render"]
+        return "gpu", []
+
+
+_env_lock = threading.Lock()
+
+
+class _DegradedRender(RuntimeError):
+    def __init__(self, problems: str, processes: list):
+        super().__init__(problems)
+        self.processes = processes
+
+
 def run_render(base_cmd: list[str], *, cwd: Path, timeout: Optional[int], runner) -> dict[str, Any]:
     """Run a Remotion CLI render GPU-first with automatic CPU fallback.
 
@@ -180,19 +256,49 @@ def run_render(base_cmd: list[str], *, cwd: Path, timeout: Optional[int], runner
     attempts = []
     if decision["gpu"]:
         cmd = with_flags(base_cmd, render_flags(gpu=True))
+        render_id = f"{os.getpid()}-{time.time_ns()}"
         try:
-            runner(cmd, timeout=timeout, cwd=cwd)
+            # Child processes (npx -> node -> Chromium -> GPU process) inherit
+            # OM_RENDER_ID, which ties the observed GPU processes to this render.
+            with _env_lock:
+                prev = os.environ.get("OM_RENDER_ID")
+                os.environ["OM_RENDER_ID"] = render_id
+            try:
+                with _GpuProcessWatch(render_id) as watch:
+                    runner(cmd, timeout=timeout, cwd=cwd)
+            finally:
+                with _env_lock:
+                    if prev is None:
+                        os.environ.pop("OM_RENDER_ID", None)
+                    else:
+                        os.environ["OM_RENDER_ID"] = prev
+            backend, problems = watch.verdict()
+            if backend == "gpu-degraded":
+                # Frames after the GPU process failure were composited on the
+                # CPU without a software rasteriser, so WebGL content may be
+                # missing: never ship it. Redo the render on the CPU path.
+                raise _DegradedRender("; ".join(problems), list(watch.seen.values())[:6])
             runtime.record_outcome("chromium-gpu", True)
-            rec = {"backend": "gpu", "renderer": decision.get("renderer"),
-                   "wall_s": round(time.time() - t0, 2), "attempts": attempts}
-            telemetry.record({"kind": "job", "op": "remotion_render", "backend": "gpu",
-                              "device": decision.get("renderer"), "wall_s": rec["wall_s"]})
+            rec = {"backend": backend, "renderer": decision.get("renderer"),
+                   "wall_s": round(time.time() - t0, 2), "attempts": attempts,
+                   "gpu_processes": list(watch.seen.values())[:6]}
+            if problems:
+                rec["warning"] = "GPU process not observed for this render: " + "; ".join(problems)
+            telemetry.record({"kind": "job", "op": "remotion_render", "backend": backend,
+                              "device": decision.get("renderer"), "wall_s": rec["wall_s"],
+                              **({"problems": problems} if problems else {})})
             return rec
         except subprocess.TimeoutExpired:
             raise
         except Exception as exc:  # GPU-specific failure: fall back below
             detail = (getattr(exc, "detail", "") or str(exc))[-600:]
-            attempts.append({"backend": "gpu", "error": detail})
+            if isinstance(exc, _DegradedRender):
+                detail = f"GPU process fell back to CPU compositing mid-render ({exc})"
+                attempts.append({"backend": "gpu-degraded", "error": detail, "gpu_processes": exc.processes})
+                telemetry.record({"kind": "job", "op": "remotion_render", "backend": "gpu-degraded",
+                                  "device": decision.get("renderer"), "problems": str(exc)})
+            else:
+                attempts.append({"backend": "gpu", "error": detail})
             if runtime.mode() == "require":
                 runtime.record_outcome("chromium-gpu", False, detail)
                 raise

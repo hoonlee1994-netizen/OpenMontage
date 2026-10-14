@@ -326,6 +326,22 @@ class VideoCompose(BaseTool):
                 "or call `hyperframes_compose` operation='doctor' directly."
             )
 
+        # GPU-native execution (lib/gpu): verified hardware backends that the
+        # render paths use by default, with automatic CPU fallback.
+        try:
+            from lib.gpu import runtime as gpu_runtime
+
+            info["gpu_runtime"] = gpu_runtime.summary()
+            info["gpu_note"] = (
+                "GPU-first: Remotion renders rasterise on the Mali GPU (bionic "
+                "Chromium + ANGLE/GLES) and all H.264/HEVC encodes run on the "
+                "MediaTek hardware encoder; failures fall back to CPU and are "
+                "reported in ToolResult.data['gpu_execution']. OM_GPU_MODE=cpu "
+                "disables, OM_GPU_MODE=require forbids fallback."
+            )
+        except Exception:
+            pass
+
         # Governance note — agents and reviewers consume this.
         info["runtime_governance"] = (
             "render_runtime is locked at proposal stage and carried unchanged "
@@ -503,10 +519,13 @@ class VideoCompose(BaseTool):
         if ed_subs.get("source") and not subtitle_path:
             subtitle_path = ed_subs["source"]
 
-        temp_dir = output_path.parent / ".compose_tmp"
+        # Unique per invocation: concurrent compose jobs writing into the same
+        # directory must not share (and delete) each other's segment files.
+        temp_dir = output_path.parent / f".compose_tmp-{output_path.stem}-{secrets.token_hex(4)}"
         temp_dir.mkdir(parents=True, exist_ok=True)
         temp_segments: list[Path] = []
         segment_cmds: list[list[str]] = []
+        gpu_t0 = time.time()
         concat_path: Path | None = None
         concat_out: Path | None = None
 
@@ -728,6 +747,8 @@ class VideoCompose(BaseTool):
             cmd.append(str(output_path))
             self.run_command(cmd)
 
+            from lib.gpu import telemetry as gpu_telemetry
+
             return ToolResult(
                 success=True,
                 data={
@@ -737,6 +758,9 @@ class VideoCompose(BaseTool):
                     "has_mixed_audio": audio_path is not None,
                     "profile": profile_name,
                     "output": str(output_path),
+                    # Which backend actually encoded each step (hardware
+                    # encoder or CPU fallback), from the execution log.
+                    "gpu_execution": gpu_telemetry.for_outputs(gpu_t0, [temp_dir, output_path]),
                 },
                 artifacts=[str(output_path)],
             )

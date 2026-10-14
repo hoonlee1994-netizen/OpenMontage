@@ -1,0 +1,369 @@
+[
+  {
+    "tag": "remotion_render",
+    "mode": "auto",
+    "rc": 0,
+    "wall_s": 71.64,
+    "device_cpu_core_s": 176.9,
+    "media_cpu_core_s": 162.1,
+    "by_process": {
+      "exe": 70.5,
+      "linker64": 43.9,
+      "headless_shell": 21.1,
+      "node": 12.5,
+      "binder:19958_4": 6.7,
+      "python3": 3.2,
+      "python": 2.0,
+      "npm exec remoti": 1.3,
+      "ffmpeg": 0.9
+    },
+    "output": {
+      "frames": 690,
+      "codec": "h264",
+      "size": "1920x1080",
+      "duration": 23.062
+    }
+  },
+  {
+    "tag": "remotion_render",
+    "mode": "cpu",
+    "rc": 0,
+    "wall_s": 601.24,
+    "device_cpu_core_s": 1799.0,
+    "media_cpu_core_s": 1624.9,
+    "by_process": {
+      "chromium": 1169.1,
+      "linker64": 327.4,
+      "python3": 56.7,
+      "ffmpeg": 48.7,
+      "node": 20.3,
+      "npm exec remoti": 1.9,
+      "python": 0.8
+    },
+    "output": null
+  },
+  {
+    "tag": "compose",
+    "mode": "cpu",
+    "rc": 0,
+    "wall_s": 66.99,
+    "device_cpu_core_s": 341.8,
+    "media_cpu_core_s": 324.6,
+    "by_process": {
+      "ffmpeg": 258.6,
+      "linker64": 40.0,
+      "python3": 24.7,
+      "ffprobe": 0.8,
+      "npm config get ": 0.3,
+      "python": 0.2
+    },
+    "rep": 0,
+    "output": {
+      "frames": 927,
+      "codec": "h264",
+      "size": "1920x1080",
+      "duration": 30.9
+    }
+  },
+  {
+    "tag": "compose",
+    "mode": "auto",
+    "rc": 0,
+    "wall_s": 26.94,
+    "device_cpu_core_s": 87.7,
+    "media_cpu_core_s": 79.2,
+    "by_process": {
+      "binder:28599_4": 25.8,
+      "linker64": 25.0,
+      "python3": 11.4,
+      "binder:27947_4": 3.5,
+      "binder:28239_4": 3.0,
+      "binder:27945_4": 2.8,
+      "binder:28252_4": 2.4,
+      "binder:28236_4": 2.3,
+      "binder:27946_4": 1.9,
+      "ffprobe": 0.7,
+      "python": 0.2,
+      "ffmpeg": 0.2
+    },
+    "rep": 0,
+    "output": {
+      "frames": 926,
+      "codec": "h264",
+      "size": "1920x1080",
+      "duration": 30.9
+    }
+  },
+  {
+    "tag": "compose",
+    "mode": "auto",
+    "rc": 0,
+    "wall_s": 34.18,
+    "device_cpu_core_s": 121.8,
+    "media_cpu_core_s": 112.2,
+    "by_process": {
+      "linker64": 33.8,
+      "binder:29539_4": 30.1,
+      "python3": 16.3,
+      "binder:29027_4": 6.7,
+      "binder:29272_4": 5.9,
+      "binder:29026_4": 5.0,
+      "binder:29308_4": 4.7,
+      "binder:29309_4": 4.3,
+      "binder:29028_4": 3.5,
+      "ffprobe": 1.3,
+      "ffmpeg": 0.3,
+      "python": 0.3
+    },
+    "rep": 1,
+    "output": {
+      "frames": 926,
+      "codec": "h264",
+      "size": "1920x1080",
+      "duration": 30.9
+    }
+  },
+  {
+    "tag": "compose",
+    "mode": "cpu",
+    "rc": 0,
+    "wall_s": 79.33,
+    "device_cpu_core_s": 448.0,
+    "media_cpu_core_s": 422.0,
+    "by_process": {
+      "ffmpeg": 338.7,
+      "linker64": 49.9,
+      "python3": 32.1,
+      "ffprobe": 1.0,
+      "python": 0.3
+    },
+    "rep": 1,
+    "output": {
+      "frames": 927,
+      "codec": "h264",
+      "size": "1920x1080",
+      "duration": 30.9
+    }
+  },
+  {
+    "tag": "compose_quality_gpu_vs_cpu",
+    "mode": "compare",
+    "quality": {
+      "vmaf": 9.95,
+      "psnr": "21.280166",
+      "ssim": 0.94899
+    }
+  },
+  {
+    "tag": "encode_1080p_crf23",
+    "mode": "cpu",
+    "rc": 0,
+    "wall_s": 23.56,
+    "device_cpu_core_s": 137.9,
+    "media_cpu_core_s": 134.1,
+    "by_process": {
+      "ffmpeg": 115.1,
+      "linker64": 11.8,
+      "python3": 7.2
+    },
+    "rep": 0,
+    "output": {
+      "frames": 900,
+      "codec": "h264",
+      "size": "1920x1080",
+      "duration": 30.059
+    },
+    "quality_vs_source": {
+      "vmaf": 93.65,
+      "psnr": "49.173845",
+      "ssim": 0.99482
+    },
+    "size_bytes": 8858072
+  },
+  {
+    "tag": "encode_1080p_crf23",
+    "mode": "auto",
+    "rc": 0,
+    "wall_s": 15.39,
+    "device_cpu_core_s": 33.1,
+    "media_cpu_core_s": 29.9,
+    "by_process": {
+      "binder:4706_4": 13.4,
+      "linker64": 10.5,
+      "python3": 5.9,
+      "ffprobe": 0.1
+    },
+    "rep": 0,
+    "output": {
+      "frames": 900,
+      "codec": "h264",
+      "size": "1920x1080",
+      "duration": 30.059
+    },
+    "quality_vs_source": {
+      "vmaf": 95.88,
+      "psnr": "50.929303",
+      "ssim": 0.99179
+    },
+    "size_bytes": 14016116
+  },
+  {
+    "tag": "encode_1080p_crf23",
+    "mode": "auto",
+    "rc": 0,
+    "wall_s": 16.66,
+    "device_cpu_core_s": 43.3,
+    "media_cpu_core_s": 39.0,
+    "by_process": {
+      "binder:8420_4": 19.0,
+      "linker64": 13.1,
+      "python3": 6.8,
+      "ffprobe": 0.1
+    },
+    "rep": 1,
+    "output": {
+      "frames": 900,
+      "codec": "h264",
+      "size": "1920x1080",
+      "duration": 30.059
+    },
+    "quality_vs_source": {
+      "vmaf": 95.88,
+      "psnr": "50.929303",
+      "ssim": 0.99179
+    },
+    "size_bytes": 14016116
+  },
+  {
+    "tag": "encode_1080p_crf23",
+    "mode": "cpu",
+    "rc": 0,
+    "wall_s": 42.08,
+    "device_cpu_core_s": 221.6,
+    "media_cpu_core_s": 213.2,
+    "by_process": {
+      "ffmpeg": 140.8,
+      "linker64": 22.4,
+      "binder:12219_4": 19.7,
+      "python3": 11.8,
+      "binder:11954_4": 10.3,
+      "binder:12931_4": 8.2
+    },
+    "rep": 1,
+    "output": {
+      "frames": 900,
+      "codec": "h264",
+      "size": "1920x1080",
+      "duration": 30.059
+    },
+    "quality_vs_source": {
+      "vmaf": 93.65,
+      "psnr": "49.173845",
+      "ssim": 0.99482
+    },
+    "size_bytes": 8858072
+  },
+  {
+    "tag": "upscale_x4plus_image",
+    "mode": "auto",
+    "rc": 0,
+    "wall_s": 21.06,
+    "device_cpu_core_s": 50.1,
+    "media_cpu_core_s": 40.5,
+    "by_process": {
+      "linker64": 16.2,
+      "python": 9.9,
+      "python3": 9.9,
+      "realesrgan-ncnn": 4.5
+    }
+  },
+  {
+    "tag": "upscale_x4plus_image",
+    "mode": "cpu",
+    "rc": 0,
+    "wall_s": 154.86,
+    "device_cpu_core_s": 570.0,
+    "media_cpu_core_s": 524.2,
+    "by_process": {
+      "python": 334.8,
+      "linker64": 107.6,
+      "python3": 53.1,
+      "ffmpeg": 10.1,
+      "binder:14644_4": 2.3,
+      "binder:14810_4": 2.2,
+      "binder:14492_4": 1.5,
+      "binder:18847_4": 0.8,
+      "binder:18764_4": 0.8,
+      "binder:16436_4": 0.8,
+      "binder:17205_4": 0.8,
+      "binder:18473_4": 0.8,
+      "binder:18372_4": 0.8,
+      "binder:18664_4": 0.8,
+      "binder:16504_4": 0.7,
+      "binder:16882_4": 0.7,
+      "binder:17534_4": 0.7,
+      "binder:18590_4": 0.7,
+      "binder:17314_4": 0.7,
+      "binder:16645_4": 0.6,
+      "binder:16841_4": 0.6,
+      "binder:16567_4": 0.6,
+      "binder:19058_4": 0.5,
+      "binder:18912_4": 0.5,
+      "binder:16922_4": 0.4,
+      "ffprobe": 0.3
+    }
+  },
+  {
+    "tag": "upscale_quality_gpu_vs_cpu",
+    "mode": "compare",
+    "quality": {
+      "vmaf": 95.61,
+      "psnr": "49.220023",
+      "ssim": 0.99786
+    }
+  },
+  {
+    "tag": "batch_6x_transcode_par3",
+    "mode": "cpu",
+    "rc": 0,
+    "wall_s": 205.91,
+    "device_cpu_core_s": 1341.5,
+    "media_cpu_core_s": 1299.5,
+    "by_process": {
+      "ffmpeg": 1168.1,
+      "linker64": 89.4,
+      "python3": 39.2,
+      "ffprobe": 1.5,
+      "python": 1.3
+    },
+    "batch": {
+      "aggregate_fps": 26.3,
+      "total_frames": 5400.0,
+      "failures": 0.0
+    }
+  },
+  {
+    "tag": "batch_6x_transcode_par3",
+    "mode": "auto",
+    "rc": 0,
+    "wall_s": 58.46,
+    "device_cpu_core_s": 293.7,
+    "media_cpu_core_s": 271.8,
+    "by_process": {
+      "linker64": 59.1,
+      "binder:20638_4": 32.0,
+      "binder:20637_4": 31.8,
+      "binder:20636_4": 31.8,
+      "binder:21154_4": 31.5,
+      "binder:21247_4": 31.5,
+      "binder:21072_4": 31.4,
+      "python3": 21.4,
+      "ffprobe": 1.3
+    },
+    "batch": {
+      "aggregate_fps": 93.4,
+      "total_frames": 5400.0,
+      "failures": 0.0
+    }
+  }
+]

@@ -20,6 +20,13 @@ unset LD_LIBRARY_PATH LD_PRELOAD
 # Use the Debian guest font configuration so font matching/fallback is the
 # same as the CPU (Debian Chromium) path.
 export FONTCONFIG_FILE="${OM_FONTCONFIG_FILE:-/etc/fonts/fonts.conf}"
+# Relative <include>s in Debian's fonts.conf resolve against FONTCONFIG_PATH.
+export FONTCONFIG_PATH="${OM_FONTCONFIG_PATH:-/etc/fonts}"
+# --disable-software-rasterizer keeps SwiftShader out. If the Mali GPU process
+# still fails, Chromium relaunches it with --use-gl=disabled (CPU compositing);
+# lib/gpu/remotion.py watches the GPU process command line of each render and
+# reports that render as degraded instead of GPU.
 exec "$OM_GPU_HOME/browser/lib/chromium/headless_shell" \
   --use-gl=angle --use-angle="$ANGLE" --enable-gpu --ignore-gpu-blocklist \
-  --enable-gpu-rasterization ${OM_CHROMIUM_EXTRA_FLAGS:-} "${args[@]}"
+  --enable-gpu-rasterization --disable-software-rasterizer \
+  ${OM_CHROMIUM_EXTRA_FLAGS:-} "${args[@]}"

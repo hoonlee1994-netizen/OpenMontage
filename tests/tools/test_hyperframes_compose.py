@@ -312,7 +312,7 @@ def test_video_compose_render_engines_follow_hyperframes_runtime_check(monkeypat
 def test_provider_menu_summary_returns_expected_shape():
     """Regression: AGENT_GUIDE.md line 246 points agents at provider_menu_summary
     for the capability menu. The shape must be stable and cover the four fields
-    the guide references."""
+    the guide references (plus gpu_runtime)."""
     from tools.tool_registry import registry
 
     registry.discover()
@@ -320,10 +320,14 @@ def test_provider_menu_summary_returns_expected_shape():
 
     assert set(s.keys()) == {
         "composition_runtimes",
+        "gpu_runtime",
         "capabilities",
         "setup_offers",
         "runtime_warnings",
     }
+    # GPU-native execution status (AGENT_GUIDE.md "Mandatory Preflight").
+    assert s["gpu_runtime"].get("mode") in {"auto", "cpu", "require", None}
+    assert isinstance(s["gpu_runtime"].get("ok"), bool)
     # Composition runtimes MUST include all three engines so the HARD RULE
     # presentation has the data it needs.
     for engine in ("ffmpeg", "remotion", "hyperframes"):

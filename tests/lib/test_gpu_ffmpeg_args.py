@@ -165,3 +165,43 @@ def test_forced_keyframes_stay_on_cpu():
 def test_default_gop_is_bounded_by_x264_default():
     gpu, _ = translate(["-y", "-i", "in.mp4", "-c:v", "libx264", "o.mp4"], available=HW)
     assert _value_after(gpu, "-g") == "250"
+
+
+# --- colour range: reproduce the replaced CPU FFmpeg's semantics ----------
+
+def test_legacy_ffmpeg_yuv420p_means_limited_range():
+    gpu, _ = translate(["-y", "-i", "in.mp4", "-c:v", "libx264", "-pix_fmt", "yuv420p", "o.mp4"],
+                       available=HW, reference="legacy")
+    assert _value_after(gpu, "-color_range") == "tv"
+
+
+def test_modern_ffmpeg_yuv420p_preserves_source_range():
+    gpu, _ = translate(["-y", "-i", "in.mp4", "-c:v", "libx264", "-pix_fmt", "yuv420p", "o.mp4"],
+                       available=HW, reference="modern")
+    assert "-color_range" not in gpu
+
+
+def test_yuvj420p_is_full_range_and_explicit_range_wins():
+    gpu, _ = translate(["-y", "-i", "in.mp4", "-c:v", "libx264", "-pix_fmt", "yuvj420p", "o.mp4"], available=HW)
+    assert _value_after(gpu, "-pix_fmt") == "yuv420p" and _value_after(gpu, "-color_range") == "pc"
+    gpu, _ = translate(["-y", "-i", "in.mp4", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                        "-color_range", "pc", "o.mp4"], available=HW, reference="legacy")
+    assert gpu.count("-color_range") == 1 and _value_after(gpu, "-color_range") == "pc"
+
+
+def test_legacy_mp4_output_pins_constant_frame_rate():
+    gpu, _ = translate(["-y", "-i", "in.mp4", "-c:v", "libx264", "o.mp4"], available=HW, reference="legacy")
+    assert _value_after(gpu, "-fps_mode") == "cfr"
+
+
+def test_modern_reference_and_vfr_containers_keep_default_sync():
+    gpu, _ = translate(["-y", "-i", "in.mp4", "-c:v", "libx264", "o.mp4"], available=HW, reference="modern")
+    assert "-fps_mode" not in gpu
+    gpu, _ = translate(["-y", "-i", "in.mp4", "-c:v", "libx264", "o.mkv"], available=HW, reference="legacy")
+    assert "-fps_mode" not in gpu
+
+
+def test_caller_sync_mode_is_respected():
+    gpu, _ = translate(["-y", "-i", "in.mp4", "-c:v", "libx264", "-vsync", "vfr", "o.mp4"],
+                       available=HW, reference="legacy")
+    assert "-fps_mode" not in gpu and _value_after(gpu, "-vsync") == "vfr"

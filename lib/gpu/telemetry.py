@@ -77,3 +77,25 @@ def summarize(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
             if ev.get(k) is not None
         })
     return {"by_backend": counts, "jobs": jobs[-50:]}
+
+
+def for_outputs(t0: float, paths) -> dict[str, Any]:
+    """Summary of jobs since ``t0`` that wrote any of ``paths``.
+
+    A path that is a directory matches every job writing inside it (e.g. a
+    compose temp dir), so concurrent jobs in one process are not mixed up.
+    """
+    import os
+
+    norm = [os.path.abspath(str(p)) for p in paths if p]
+    picked = []
+    for ev in since(t0):
+        outs = [os.path.abspath(o) for o in str(ev.get("output") or "").split(",") if o]
+        if any(o == p or o.startswith(p.rstrip("/") + "/") for o in outs for p in norm):
+            picked.append(ev)
+    summary = summarize(picked)
+    backends = summary["by_backend"]
+    summary["backend"] = ("gpu" if backends and set(backends) == {"gpu"} else
+                          "cpu" if backends and "gpu" not in backends else
+                          "mixed" if backends else "none")
+    return summary

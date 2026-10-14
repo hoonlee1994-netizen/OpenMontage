@@ -1,0 +1,222 @@
+{
+  "jobs": 9,
+  "succeeded": 9,
+  "valid_outputs": 9,
+  "total_wall_s": 302.4,
+  "fault_injected": {
+    "pid": 16727,
+    "t": 1791980867.2537148,
+    "cmd": [
+      "/data/data/com.termux/files/home/.openmontage-gpu/prefix/bin/ffmpeg",
+      "-y",
+      "-ss",
+      "20",
+      "-t",
+      "8",
+      "-i",
+      "/root/projects/openmontage/assets/signal-from-tomorrow-demo.mp4",
+      "-c:v",
+      "h264_mediacodec",
+      "-bitrate_mode",
+      "cq"
+    ]
+  },
+  "backends": {
+    "gpu": 16,
+    "cpu": 1
+  },
+  "fallback_events": [
+    {
+      "t": 1791980877.561,
+      "pid": 16724,
+      "kind": "job",
+      "op": "ffmpeg",
+      "backend": "cpu",
+      "fallback_reason": "native ffmpeg exit -9:   Stream #0:0 -> #0:0 (h264 (native) -> h264 (h264_mediacodec)) |   Stream #0:1 -> #0:1 (aac (native) -> aac (native)) | Press [q] to stop, [?] for help | [swscaler @ 0xb400006f57a8a480] deprecated pixel format used, make sure you did set range correctly",
+      "rc": 0,
+      "wall_s": 11.946,
+      "output": "/tmp/claude-0/-root-projects-openmontage/16281f80-c812-4b56-9176-f0120c37fc70/scratchpad/soak/.compose_tmp/seg_0001.mp4"
+    }
+  ],
+  "results": [
+    {
+      "job": "remotion world-in-numbers",
+      "success": true,
+      "valid_output": true,
+      "wall_s": 136.9,
+      "output": {
+        "video": true,
+        "audio": true,
+        "frames": 675,
+        "size": "1920x1080",
+        "duration": 22.55
+      },
+      "gpu_execution": {
+        "backend": "gpu",
+        "renderer": "ANGLE (ARM, Mali-G720 MC8, OpenGL ES 3.2)",
+        "wall_s": 131.78,
+        "attempts": [],
+        "gpu_processes": [
+          [
+            "--use-angle=gles-egl",
+            "--use-gl=angle"
+          ]
+        ]
+      },
+      "error": ""
+    },
+    {
+      "job": "compose 1",
+      "success": true,
+      "valid_output": true,
+      "wall_s": 13.0,
+      "output": {
+        "video": true,
+        "audio": true,
+        "frames": 390,
+        "size": "1920x1080",
+        "duration": 13.022
+      },
+      "gpu_execution": null,
+      "error": ""
+    },
+    {
+      "job": "remotion focusflow-pitch",
+      "success": true,
+      "valid_output": true,
+      "wall_s": 110.7,
+      "output": {
+        "video": true,
+        "audio": true,
+        "frames": 675,
+        "size": "1920x1080",
+        "duration": 22.55
+      },
+      "gpu_execution": {
+        "backend": "gpu",
+        "renderer": "ANGLE (ARM, Mali-G720 MC8, OpenGL ES 3.2)",
+        "wall_s": 107.38,
+        "attempts": [],
+        "gpu_processes": [
+          [
+            "--use-angle=gles-egl",
+            "--use-gl=angle"
+          ]
+        ]
+      },
+      "error": ""
+    },
+    {
+      "job": "compose 2 (fault injected)",
+      "success": true,
+      "valid_output": true,
+      "wall_s": 18.9,
+      "output": {
+        "video": true,
+        "audio": true,
+        "frames": 494,
+        "size": "1920x1080",
+        "duration": 16.488
+      },
+      "gpu_execution": null,
+      "error": ""
+    },
+    {
+      "job": "upscale image",
+      "success": true,
+      "valid_output": true,
+      "wall_s": 20.6,
+      "output": {
+        "image": [
+          1920,
+          1080
+        ]
+      },
+      "gpu_execution": {
+        "backend": "gpu",
+        "device": "Mali-G720 MC8",
+        "engine": "ncnn-vulkan",
+        "model": "realesrgan-x4plus",
+        "wall_s": 18.295
+      },
+      "error": ""
+    },
+    {
+      "job": "remotion code-to-screen",
+      "success": true,
+      "valid_output": true,
+      "wall_s": 108.4,
+      "output": {
+        "video": true,
+        "audio": true,
+        "frames": 750,
+        "size": "1920x1080",
+        "duration": 25.046
+      },
+      "gpu_execution": {
+        "backend": "gpu",
+        "renderer": "ANGLE (ARM, Mali-G720 MC8, OpenGL ES 3.2)",
+        "wall_s": 104.97,
+        "attempts": [],
+        "gpu_processes": [
+          [
+            "--use-angle=gles-egl",
+            "--use-gl=angle"
+          ]
+        ]
+      },
+      "error": ""
+    },
+    {
+      "job": "compose 3",
+      "success": true,
+      "valid_output": true,
+      "wall_s": 15.8,
+      "output": {
+        "video": true,
+        "audio": true,
+        "frames": 390,
+        "size": "1920x1080",
+        "duration": 13.022
+      },
+      "gpu_execution": null,
+      "error": ""
+    },
+    {
+      "job": "upscale video 1s",
+      "success": true,
+      "valid_output": true,
+      "wall_s": 129.1,
+      "output": {
+        "video": true,
+        "audio": true,
+        "frames": 30,
+        "size": "960x544",
+        "duration": 1.0
+      },
+      "gpu_execution": {
+        "backend": "gpu",
+        "device": "Mali-G720 MC8",
+        "engine": "ncnn-vulkan",
+        "model": "realesrgan-x4plus",
+        "wall_s": 118.303
+      },
+      "error": ""
+    },
+    {
+      "job": "compose 4",
+      "success": true,
+      "valid_output": true,
+      "wall_s": 25.4,
+      "output": {
+        "video": true,
+        "audio": true,
+        "frames": 900,
+        "size": "1920x1080",
+        "duration": 30.022
+      },
+      "gpu_execution": null,
+      "error": ""
+    }
+  ]
+}

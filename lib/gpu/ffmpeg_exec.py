@@ -149,6 +149,69 @@ def _remove_partial(paths: list, before: dict) -> None:
                 pass
 
 
+def _temp_path(final: str) -> str:
+    """A unique sibling of ``final`` that keeps its extension (same muxer)."""
+    d, name = os.path.split(final)
+    root, ext = os.path.splitext(name)
+    token = f".om-gpu-{os.getpid()}-{os.urandom(4).hex()}"
+    return os.path.join(d, token + ext) if d else token + ext
+
+
+def _stage_outputs(cmd: list, gpu_plans: list) -> "tuple[list, list] | None":
+    """Redirect GPU file outputs to per-attempt temp files in the same directory.
+
+    The hardware attempt then can never overwrite a user's file directly, and a
+    failed or orphaned encoder leaves only a temp path that the *next* attempt
+    does not reuse (so a retry can never race a live writer on the real output).
+    The temps are published with an atomic ``os.replace`` only after they
+    validate; any failure discards them and leaves the original untouched.
+
+    Returns ``(staged_cmd, [(final, temp), ...])``, or ``None`` when the command
+    must not be staged — an existing output without ``-y`` (refuse/prompt
+    semantics must be preserved) or an output token that cannot be located.
+    """
+    has_y = "-y" in cmd
+    staged = list(cmd)
+    pairs = []
+    for p in gpu_plans:
+        if ffmpeg_args.is_pipe(p.target):
+            continue
+        final = p.target
+        if not has_y and os.path.exists(final):
+            return None  # ffmpeg would refuse to overwrite; do not fake success
+        idx = None
+        for i in range(len(staged) - 1, -1, -1):  # outputs trail their options
+            if staged[i] == final:
+                idx = i
+                break
+        if idx is None:
+            return None
+        temp = _temp_path(final)
+        staged[idx] = temp
+        pairs.append((final, temp))
+    if not pairs:
+        return None
+    return staged, pairs
+
+
+def _commit_outputs(pairs: list) -> "str | None":
+    """Atomically publish validated temps over their final paths."""
+    for final, temp in pairs:
+        try:
+            os.replace(temp, final)
+        except OSError as exc:
+            return f"could not publish {final}: {exc}"
+    return None
+
+
+def _discard_outputs(pairs: list) -> None:
+    for _final, temp in pairs:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+
+
 def _reference_semantics(ffmpeg_path: str) -> str:
     """'legacy' for a reference FFmpeg < 7, else 'modern' (see ffmpeg_args.translate).
 
@@ -321,6 +384,13 @@ def dispatch(argv: list[str]) -> int:
             pass
     native_cmd = [str(runtime.native_ffmpeg()), *gpu_argv]
     streaming = ffmpeg_args.reads_stdin(argv) or ffmpeg_args.writes_stdout(argv)
+    # Text that is rasterised with the system font stack (subtitles, ASS,
+    # drawtext) must resolve the same fonts as the Debian tools. The PRoot-free
+    # worker sees the Android host namespace, where Debian's /usr/share/fonts
+    # and /etc/fonts are absent, so libass would emit missing-glyph boxes while
+    # still exiting 0. Keep those commands on the traced native path, which
+    # has the Debian font configuration and still hardware-encodes.
+    text_render = ffmpeg_args.renders_text(argv)
     backend_healthy = runtime.healthy(BACKEND)
 
     if not backend_healthy and mode == "auto":
@@ -352,9 +422,19 @@ def dispatch(argv: list[str]) -> int:
 
         file_outputs = [p.target for p in gpu_plans if not ffmpeg_args.is_pipe(p.target)]
         before = _snapshot(file_outputs)
-        rc, err = _run_native(native_cmd, capture_stderr=True, allow_remote=solo)
-        problem = f"native ffmpeg exit {rc}" if rc != 0 else _validate(
-            [p.target for p in gpu_plans if not ffmpeg_args.is_pipe(p.target)])
+        # Stage file outputs to per-attempt temps: a failed or orphaned
+        # hardware encoder writes a temp path, never the user's final file, and
+        # a retry uses a fresh temp rather than racing a live writer.
+        staged = _stage_outputs(native_cmd, gpu_plans)
+        run_cmd, staged_pairs = staged if staged else (native_cmd, [])
+        rc, err = _run_native(run_cmd, capture_stderr=True,
+                              allow_remote=solo and not text_render)
+        produced = [t for _f, t in staged_pairs] or file_outputs
+        problem = f"native ffmpeg exit {rc}" if rc != 0 else _validate(produced)
+        if problem is None and staged_pairs:
+            problem = _commit_outputs(staged_pairs)
+        if problem is not None:
+            _discard_outputs(staged_pairs)
 
     if problem is None:
         runtime.record_outcome(BACKEND, True)
@@ -362,7 +442,7 @@ def dispatch(argv: list[str]) -> int:
         sys.stderr.flush()
         telemetry.record({"kind": "job", "op": "ffmpeg", "backend": "gpu",
                           "encoder": f"{codec}_mediacodec", "device": enc.get("component"),
-                          "oop": OOP_LAST,
+                          "oop": OOP_LAST, "text_render": text_render,
                           "rc": 0, "wall_s": round(time.time() - t0, 3),
                           "output": ",".join(p.target for p in gpu_plans)})
         return 0

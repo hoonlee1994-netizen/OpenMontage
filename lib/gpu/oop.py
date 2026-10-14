@@ -357,10 +357,11 @@ def run(argv: "list[str]", *, cwd: "str | None" = None, env: "dict[str, str] | N
     }
     if stdin is not None:
         req["stdin_b64"] = base64.b64encode(stdin).decode()
-    res = _call(req, timeout + 30)
-    if res is None and ensure_worker(1.0):
-        res = _call(req, timeout + 30)
-    return res
+    # A single attempt only. Replaying the same command after a dropped
+    # connection used to risk a second writer on the same output while the old
+    # one was not yet known dead; the caller instead falls back to the traced
+    # native path (and its staged outputs) when this returns None.
+    return _call(req, timeout + 30)
 
 
 def stop() -> None:

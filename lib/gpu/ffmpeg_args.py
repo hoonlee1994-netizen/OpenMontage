@@ -52,9 +52,19 @@ _X26X_ONLY = {
 _VIDEO_EXT = {".mp4", ".m4v", ".mov", ".mkv", ".ts", ".mts", ".flv", ".3gp"}
 _IMAGE_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif", ".tif", ".tiff", ".apng"}
 _AUDIO_EXT = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wma", ".aiff"}
-_DEFAULT_H264_FORMATS = {"mp4", "mov", "matroska", "mkv", "mpegts", "flv", "ipod", "3gp"}
+# Containers whose *implicit* video encoder (no ``-c:v``) is H.264, verified
+# against ``ffmpeg -h muxer=<m>``: mp4/mov/matroska/ipod default to h264, while
+# mpegts defaults to mpeg2video, flv to flv1 and 3gp to h263 (m4v to mpeg4).
+# Translating those to H.264 would change the codec family, so they stay CPU.
+_DEFAULT_H264_FORMATS = {"mp4", "mov", "matroska", "mkv", "ipod"}
 
-_SUPPORTED_PIX = {None, "yuv420p", "yuvj420p", "nv12"}
+# ``-pix_fmt`` values the MediaCodec encoders reproduce losslessly (8-bit
+# 4:2:0). ``None`` is deliberately *absent*: without an explicit ``-pix_fmt``
+# the CPU encoder picks the format from the input and filter graph (10-bit
+# sources stay 10-bit, 4:4:4 stays 4:4:4, some filters promote 4:2:0 to
+# 4:4:4), so no explicit request means the output contract cannot be
+# guaranteed on the hardware encoder.
+_SUPPORTED_PIX = {"yuv420p", "yuvj420p", "nv12"}
 _H264_PROFILES = {"baseline", "main", "high"}
 _HEVC_PROFILES = {"main"}
 
@@ -261,7 +271,7 @@ def plan_output(seg: Segment, idx: int, parsed=None, probe_fps=None) -> OutputPl
     if vcodec == "copy":
         return OutputPlan(idx, target, "none", "stream copy")
     if vcodec is None:
-        if container in _DEFAULT_H264_FORMATS or container in {"mp4", "m4v", "mov", "mkv", "ts", "mts", "3gp"}:
+        if container in _DEFAULT_H264_FORMATS:
             vcodec = "libx264"  # FFmpeg's default video encoder for these muxers
         else:
             return OutputPlan(idx, target, "cpu", f"implicit encoder for container {container or '?'}")
@@ -270,6 +280,13 @@ def plan_output(seg: Segment, idx: int, parsed=None, probe_fps=None) -> OutputPl
         return OutputPlan(idx, target, "cpu", f"no hardware encoder for {vcodec}")
 
     pix = _last(seg.opts, ("-pix_fmt", "-pix_fmt:v"))
+    if pix is None:
+        # No explicit pixel format: the CPU encoder would derive it from the
+        # input and filter graph (10-bit / 4:4:4 preserved, 4:2:0 sometimes
+        # promoted), and the hardware encoder always emits 8-bit 4:2:0.
+        # Translation would silently change bit depth / chroma sampling.
+        return OutputPlan(idx, target, "cpu",
+                          "output pixel format not specified (hardware encoder would force 8-bit 4:2:0)")
     if pix not in _SUPPORTED_PIX:
         return OutputPlan(idx, target, "cpu", f"pixel format {pix} not supported by hardware encoder")
     crf_s = _last(seg.opts, ("-crf", "-crf:v", "-crf:v:0"))
@@ -436,3 +453,38 @@ def reads_stdin(argv: list[str]) -> bool:
 def writes_stdout(argv: list[str]) -> bool:
     parsed = parse(argv)
     return any(is_pipe(s.target) for s in parsed.outputs)
+
+
+# Filters that rasterise text through the system font stack (libass / freetype
+# / fontconfig), plus the options and file types that imply one.  The leading
+# guards keep unrelated tokens like ``bass=f=80`` from matching ``ass``.
+_TEXT_FILTER_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:drawtext|subtitles|ass|showtext)\b", re.IGNORECASE)
+_FONT_OPTION_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:fontfile|fontsdir|font|textfile)=", re.IGNORECASE)
+_FONT_FILE_RE = re.compile(r"\.(?:ttf|otf|ttc|pfb|pfa)\b", re.IGNORECASE)
+
+
+def renders_text(argv: list[str]) -> bool:
+    """True when the command rasterises text with the host font stack.
+
+    Such commands depend on fontconfig resolving the same fonts as the Debian
+    tools.  The PRoot-free worker runs in the Android host namespace, where
+    ``/usr/share/fonts`` and Debian's ``/etc/fonts`` are invisible, so libass
+    silently renders missing-glyph boxes while still exiting 0.  Callers keep
+    these commands on the traced native path, which sees the Debian fonts.
+    """
+    for i, a in enumerate(argv):
+        if not isinstance(a, str):
+            continue
+        if a.startswith("-") and a[1:].split(":", 1)[0] in (
+                "vf", "filter", "filter_complex", "lavfi", "af", "filter_script", "filter_complex_script"):
+            # Inspect the filter graph value itself (and any script path).
+            value = argv[i + 1] if i + 1 < len(argv) and isinstance(argv[i + 1], str) else ""
+            if _TEXT_FILTER_RE.search(value) or _FONT_OPTION_RE.search(value):
+                return True
+            if value and _FONT_FILE_RE.search(value):
+                return True
+        if _FONT_FILE_RE.search(a):
+            return True
+    return False

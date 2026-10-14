@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from lib.gpu.ffmpeg_args import crf_to_cq, parse, reads_stdin, translate, writes_stdout
+from lib.gpu.ffmpeg_args import crf_to_cq, parse, reads_stdin, renders_text, translate, writes_stdout
 
 HW = {"h264", "hevc"}
 
@@ -38,12 +38,14 @@ def test_segment_normalize_command_is_translated_with_everything_else_kept():
 
 
 @pytest.mark.parametrize("argv,reason", [
-    (["-y", "-i", "in.mp4", "-c:v", "libx264", "-crf", "0", "o.mp4"], "lossless"),
-    (["-y", "-i", "in.mp4", "-c:v", "libx264", "-qp", "0", "o.mp4"], "lossless"),
-    (["-y", "-i", "in.mp4", "-c:v", "libx264", "-x264-params", "lossless=1", "o.mp4"], "lossless"),
+    (["-y", "-i", "in.mp4", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "0", "o.mp4"], "lossless"),
+    (["-y", "-i", "in.mp4", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-qp", "0", "o.mp4"], "lossless"),
+    (["-y", "-i", "in.mp4", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+      "-x264-params", "lossless=1", "o.mp4"], "lossless"),
     (["-y", "-i", "in.mp4", "-c:v", "libx264", "-pix_fmt", "yuv444p", "o.mp4"], "pixel format"),
     (["-y", "-i", "in.mp4", "-c:v", "libx264", "-pix_fmt", "yuv420p10le", "o.mp4"], "pixel format"),
-    (["-y", "-i", "in.mp4", "-c:v", "libx264", "-profile:v", "high444", "o.mp4"], "profile"),
+    (["-y", "-i", "in.mp4", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+      "-profile:v", "high444", "o.mp4"], "profile"),
     (["-y", "-i", "in.mp4", "-c:v", "libvpx-vp9", "o.webm"], "no hardware encoder"),
     (["-y", "-i", "in.mp4", "-c:v", "prores_ks", "o.mov"], "no hardware encoder"),
 ])
@@ -70,14 +72,42 @@ def test_commands_without_video_encode_are_left_alone(argv):
 
 
 def test_implicit_default_encoder_for_mp4_is_translated():
-    gpu, plans = translate(["-y", "-i", "in.mp4", "-vf", "scale=1280:-2", "out.mp4"], available=HW)
+    gpu, plans = translate(["-y", "-i", "in.mp4", "-vf", "scale=1280:-2", "-pix_fmt", "yuv420p", "out.mp4"],
+                           available=HW)
     assert plans[0].source_encoder == "libx264"
     assert _value_after(gpu, "-c:v") == "h264_mediacodec"
     assert _value_after(gpu, "-global_quality") == str(crf_to_cq(23, "h264"))  # libx264 default CRF
 
 
+def test_unspecified_pixel_format_stays_on_cpu():
+    # Without -pix_fmt the CPU encoder derives the format from the input and
+    # filter graph (10-bit stays 10-bit, 4:4:4 stays 4:4:4, some filters
+    # promote 4:2:0 to 4:4:4). The hardware encoder only emits 8-bit 4:2:0,
+    # so translating would silently change the output contract.
+    gpu, plans = translate(["-y", "-i", "in.mp4", "-c:v", "libx264", "-crf", "23", "out.mp4"], available=HW)
+    assert gpu is None and plans[0].action == "cpu"
+    assert "pixel format" in plans[0].reason
+
+
+@pytest.mark.parametrize("container", ["mpegts", "ts", "mts", "flv", "3gp", "m4v"])
+def test_implicit_non_h264_container_encoders_stay_on_cpu(container):
+    # ffmpeg -h muxer=... : mpegts -> mpeg2video, flv -> flv1, 3gp -> h263,
+    # m4v -> mpeg4. Translating an implicit default to H.264 changes the codec
+    # family, so only the containers whose default really is H.264 move.
+    gpu, plans = translate(["-y", "-i", "in.mp4", "-pix_fmt", "yuv420p", f"out.{container}"], available=HW)
+    assert gpu is None and plans[0].action == "cpu"
+    assert "implicit encoder" in plans[0].reason
+
+
+def test_implicit_h264_containers_are_translated():
+    for ext in ("mp4", "mov", "mkv"):
+        gpu, plans = translate(["-y", "-i", "in.mp4", "-pix_fmt", "yuv420p", f"out.{ext}"], available=HW)
+        assert plans[0].source_encoder == "libx264" and _value_after(gpu, "-c:v") == "h264_mediacodec"
+
+
 def test_explicit_bitrate_uses_vbr_and_user_gop_is_kept():
-    gpu, _ = translate(["-y", "-i", "in.mp4", "-c:v", "libx264", "-b:v", "5M", "-g", "60", "o.mp4"],
+    gpu, _ = translate(["-y", "-i", "in.mp4", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                        "-b:v", "5M", "-g", "60", "o.mp4"],
                        available=HW, probe_fps=lambda path: 30.0)
     assert _value_after(gpu, "-bitrate_mode") == "vbr"
     assert "-global_quality" not in gpu
@@ -85,14 +115,15 @@ def test_explicit_bitrate_uses_vbr_and_user_gop_is_kept():
 
 
 def test_hevc_maps_to_hevc_hardware_encoder_and_keeps_tag():
-    gpu, _ = translate(["-y", "-i", "in.mp4", "-c:v", "libx265", "-crf", "28", "-tag:v", "hvc1", "o.mp4"],
-                       available=HW)
+    gpu, _ = translate(["-y", "-i", "in.mp4", "-c:v", "libx265", "-pix_fmt", "yuv420p",
+                        "-crf", "28", "-tag:v", "hvc1", "o.mp4"], available=HW)
     assert _value_after(gpu, "-c:v") == "hevc_mediacodec"
     assert _value_after(gpu, "-tag:v") == "hvc1"
 
 
 def test_unverified_hardware_encoder_keeps_cpu():
-    gpu, plans = translate(["-y", "-i", "in.mp4", "-c:v", "libx265", "o.mp4"], available={"h264"})
+    gpu, plans = translate(["-y", "-i", "in.mp4", "-c:v", "libx265", "-pix_fmt", "yuv420p", "o.mp4"],
+                           available={"h264"})
     assert gpu is None and plans[0].action == "cpu" and "not verified" in plans[0].reason
 
 
@@ -109,7 +140,7 @@ def test_remotion_prestitcher_stream_from_stdin():
 
 
 def test_multiple_outputs_are_planned_independently():
-    argv = ["-y", "-i", "in.mp4", "-c:v", "libx264", "-crf", "20", "a.mp4",
+    argv = ["-y", "-i", "in.mp4", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20", "a.mp4",
             "-c:v", "libvpx-vp9", "b.webm", "-c", "copy", "c.mkv"]
     gpu, plans = translate(argv, available=HW)
     assert [p.action for p in plans] == ["gpu", "cpu", "none"]
@@ -132,38 +163,41 @@ def test_crf_mapping_is_monotonic_and_clamped():
 
 def test_gop_not_whole_seconds_stays_on_cpu():
     argv = ["-y", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=30:duration=6",
-            "-c:v", "libx264", "-g", "12", "o.mp4"]
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "12", "o.mp4"]
     gpu, plans = translate(argv, available=HW)
     assert gpu is None and "whole number of seconds" in plans[0].reason
 
 
 def test_gop_whole_seconds_moves_to_hardware_and_is_kept():
-    argv = ["-y", "-i", "in.mp4", "-vf", "fps=30", "-c:v", "libx264", "-g", "60", "o.mp4"]
+    argv = ["-y", "-i", "in.mp4", "-vf", "fps=30", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-g", "60", "o.mp4"]
     gpu, plans = translate(argv, available=HW)
     assert plans[0].action == "gpu" and _value_after(gpu, "-g") == "60"
 
 
 def test_gop_with_unknown_frame_rate_stays_on_cpu():
-    gpu, plans = translate(["-y", "-i", "in.mp4", "-c:v", "libx264", "-g", "60", "o.mp4"], available=HW)
+    gpu, plans = translate(["-y", "-i", "in.mp4", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                            "-g", "60", "o.mp4"], available=HW)
     assert gpu is None and "frame rate unknown" in plans[0].reason
 
 
 def test_x264_keyint_is_carried_over_as_gop():
-    argv = ["-y", "-i", "in.mp4", "-c:v", "libx264", "-x264-params", "keyint=48:scenecut=0",
-            "-r", "24", "o.mp4"]
+    argv = ["-y", "-i", "in.mp4", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-x264-params", "keyint=48:scenecut=0", "-r", "24", "o.mp4"]
     gpu, plans = translate(argv, available=HW)
     assert plans[0].action == "gpu" and _value_after(gpu, "-g") == "48"
     assert "-x264-params" not in gpu
 
 
 def test_forced_keyframes_stay_on_cpu():
-    gpu, plans = translate(["-y", "-i", "in.mp4", "-c:v", "libx264", "-force_key_frames",
-                            "expr:gte(t,n_forced*2)", "o.mp4"], available=HW)
+    gpu, plans = translate(["-y", "-i", "in.mp4", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                            "-force_key_frames", "expr:gte(t,n_forced*2)", "o.mp4"], available=HW)
     assert gpu is None and "forced keyframes" in plans[0].reason
 
 
 def test_default_gop_is_bounded_by_x264_default():
-    gpu, _ = translate(["-y", "-i", "in.mp4", "-c:v", "libx264", "o.mp4"], available=HW)
+    gpu, _ = translate(["-y", "-i", "in.mp4", "-c:v", "libx264", "-pix_fmt", "yuv420p", "o.mp4"],
+                       available=HW)
     assert _value_after(gpu, "-g") == "250"
 
 
@@ -190,18 +224,50 @@ def test_yuvj420p_is_full_range_and_explicit_range_wins():
 
 
 def test_legacy_mp4_output_pins_constant_frame_rate():
-    gpu, _ = translate(["-y", "-i", "in.mp4", "-c:v", "libx264", "o.mp4"], available=HW, reference="legacy")
+    gpu, _ = translate(["-y", "-i", "in.mp4", "-c:v", "libx264", "-pix_fmt", "yuv420p", "o.mp4"],
+                       available=HW, reference="legacy")
     assert _value_after(gpu, "-fps_mode") == "cfr"
 
 
 def test_modern_reference_and_vfr_containers_keep_default_sync():
-    gpu, _ = translate(["-y", "-i", "in.mp4", "-c:v", "libx264", "o.mp4"], available=HW, reference="modern")
+    gpu, _ = translate(["-y", "-i", "in.mp4", "-c:v", "libx264", "-pix_fmt", "yuv420p", "o.mp4"],
+                       available=HW, reference="modern")
     assert "-fps_mode" not in gpu
-    gpu, _ = translate(["-y", "-i", "in.mp4", "-c:v", "libx264", "o.mkv"], available=HW, reference="legacy")
+    gpu, _ = translate(["-y", "-i", "in.mp4", "-c:v", "libx264", "-pix_fmt", "yuv420p", "o.mkv"],
+                       available=HW, reference="legacy")
     assert "-fps_mode" not in gpu
 
 
 def test_caller_sync_mode_is_respected():
-    gpu, _ = translate(["-y", "-i", "in.mp4", "-c:v", "libx264", "-vsync", "vfr", "o.mp4"],
-                       available=HW, reference="legacy")
+    gpu, _ = translate(["-y", "-i", "in.mp4", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                        "-vsync", "vfr", "o.mp4"], available=HW, reference="legacy")
     assert "-fps_mode" not in gpu and _value_after(gpu, "-vsync") == "vfr"
+
+
+# --- text rendering must keep the Debian font stack (PRoot traced path) ----
+
+@pytest.mark.parametrize("argv", [
+    ["-y", "-i", "in.mp4", "-vf", "subtitles=a.srt", "-c:v", "libx264", "-pix_fmt", "yuv420p", "o.mp4"],
+    ["-y", "-i", "in.mp4", "-filter_complex", "[0:v]ass=a.ass[v]", "-map", "[v]",
+     "-c:v", "libx264", "-pix_fmt", "yuv420p", "o.mp4"],
+    ["-y", "-i", "in.mp4", "-vf", "drawtext=text='hi':fontfile=/f.ttf", "-c:v", "libx264",
+     "-pix_fmt", "yuv420p", "o.mp4"],
+    ["-y", "-i", "in.mp4", "-vf", "drawtext=text='hi':fontsize=32", "-c:v", "libx264",
+     "-pix_fmt", "yuv420p", "o.mp4"],
+    ["-y", "-i", "in.mp4", "-vf", "subtitles=filename=subs.vtt:fontsdir=/fonts", "-c:v", "libx264",
+     "-pix_fmt", "yuv420p", "o.mp4"],
+])
+def test_text_rendering_commands_are_detected(argv):
+    assert renders_text(argv)
+
+
+@pytest.mark.parametrize("argv", [
+    ["-y", "-i", "in.mp4", "-vf", "scale=1280:-2,fps=30", "-c:v", "libx264", "-pix_fmt", "yuv420p", "o.mp4"],
+    ["-y", "-i", "in.mp4", "-c:v", "libx264", "-pix_fmt", "yuv420p", "o.mp4"],
+    ["-y", "-i", "subs.srt", "-i", "in.mp4", "-c:v", "copy", "-c:s", "mov_text", "o.mp4"],
+    ["-y", "-i", "in.mp4", "-af", "loudnorm", "-c:v", "libx264", "-pix_fmt", "yuv420p", "o.mp4"],
+    ["-y", "-i", "in.mp4", "-af", "bass=f=80,treble=f=80", "-c:v", "libx264",
+     "-pix_fmt", "yuv420p", "o.mp4"],  # 'bass=' must not look like the ass filter
+])
+def test_non_text_commands_are_not_flagged(argv):
+    assert not renders_text(argv)

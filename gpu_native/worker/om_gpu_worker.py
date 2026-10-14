@@ -33,6 +33,47 @@ import time
 
 MAX_FRAME = 64 * 1024 * 1024
 
+# Encoder children currently running for a client. Bounded to the worker's
+# lifetime: a normal stop kills them, and SIGKILL of the worker is covered by
+# the child's own PR_SET_PDEATHSIG (set in the preexec hook below).
+_active: "dict[int, subprocess.Popen]" = {}
+_active_lock = threading.Lock()
+
+
+def _bind_child_death() -> None:
+    """preexec hook: ask the kernel to SIGKILL the child if this thread dies.
+
+    Runs in the forked child before exec.  PR_SET_PDEATHSIG fires when the
+    *thread* that forked the child terminates, so the encoder cannot outlive a
+    SIGKILLed worker (the signal handlers below are not run for SIGKILL).
+    """
+    try:
+        import ctypes
+
+        ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG
+    except Exception:
+        pass
+
+
+def _kill_child(proc: "subprocess.Popen") -> None:
+    """Kill an encoder and its process group (dropping the socket is not enough)."""
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)  # start_new_session -> own group
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def _kill_all_children() -> None:
+    with _active_lock:
+        procs = list(_active.values())
+    for proc in procs:
+        _kill_child(proc)
+
 
 def _recv_exact(conn: socket.socket, n: int) -> "bytes | None":
     buf = bytearray()
@@ -78,7 +119,11 @@ def _handle(conn: socket.socket) -> None:
                 argv, cwd=cwd, env=env,
                 stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                start_new_session=True,
+                preexec_fn=_bind_child_death,
             )
+            with _active_lock:
+                _active[proc.pid] = proc
             # If the client (the shim) dies, the socket closes: kill the child
             # so it cannot outlive the codec slot its caller was holding.
             def watch() -> None:
@@ -88,23 +133,25 @@ def _handle(conn: socket.socket) -> None:
                             break
                 except OSError:
                     pass
-                if proc.poll() is None:
-                    try:
-                        proc.kill()
-                    except OSError:
-                        pass
+                _kill_child(proc)
 
             threading.Thread(target=watch, daemon=True).start()
-            out, err = proc.communicate(stdin, timeout=timeout)
+            try:
+                out, err = proc.communicate(stdin, timeout=timeout)
+            finally:
+                with _active_lock:
+                    _active.pop(proc.pid, None)
             resp = {"rc": proc.returncode, "wall_ms": int((time.monotonic() - t0) * 1000),
                     "stdout_b64": base64.b64encode(out or b"").decode(),
                     "stderr_b64": base64.b64encode(err or b"").decode()}
         except subprocess.TimeoutExpired:
+            _kill_child(proc)
             try:
-                proc.kill()
                 proc.communicate(timeout=10)
             except Exception:
                 pass
+            with _active_lock:
+                _active.pop(proc.pid, None)
             resp = {"rc": -9, "wall_ms": int((time.monotonic() - t0) * 1000),
                     "stdout_b64": "", "stderr_b64": "", "error": "timeout"}
         except Exception as exc:  # report, never die
@@ -138,6 +185,9 @@ def serve(sock_path: str, ready_path: "str | None") -> None:
             fh.write(str(os.getpid()))
 
     def stop(_signum, _frame):
+        # A normal stop must take the running encoders with it: they hold codec
+        # sessions and are still writing their (staged) outputs.
+        _kill_all_children()
         try:
             os.unlink(sock_path)
         except OSError:

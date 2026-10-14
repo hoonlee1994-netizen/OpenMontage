@@ -1,0 +1,5 @@
+#!/bin/sh
+# OpenMontage GPU-first ffmpeg dispatcher (lib/gpu/ffmpeg_exec.py).
+# Video encodes run on the verified MediaCodec hardware encoder; everything
+# else, and any failed GPU run, uses the Debian ffmpeg unchanged.
+exec /usr/bin/python3 -I -S "${0%/*}/../ffmpeg_dispatch.py" "$@"

@@ -1,0 +1,25 @@
+#!/bin/bash
+# GPU-native Chromium launcher for Remotion / HyperFrames.
+#
+# Runs the project-scoped Termux (bionic) Chromium headless_shell so its GPU
+# process can load the Android vendor Mali driver, which Debian's glibc
+# Chromium cannot (it only gets SwiftShader / llvmpipe). Callers pass their
+# usual flags; renderer-selection flags are replaced with the GPU backend.
+OM_GPU_HOME="${OM_GPU_HOME:-/data/data/com.termux/files/home/.openmontage-gpu}"
+ANGLE="${OM_CHROMIUM_ANGLE:-gles-egl}"
+args=()
+for a in "$@"; do
+  case "$a" in
+    --use-gl=*|--use-angle=*|--use-vulkan*|--disable-gpu|--disable-gpu-compositing|\
+    --enable-unsafe-swiftshader|--disable-vulkan-surface|--disable-vulkan-fallback-to-gl-for-testing|\
+    --disable-software-rasterizer) ;;
+    *) args+=("$a") ;;
+  esac
+done
+unset LD_LIBRARY_PATH LD_PRELOAD
+# Use the Debian guest font configuration so font matching/fallback is the
+# same as the CPU (Debian Chromium) path.
+export FONTCONFIG_FILE="${OM_FONTCONFIG_FILE:-/etc/fonts/fonts.conf}"
+exec "$OM_GPU_HOME/browser/lib/chromium/headless_shell" \
+  --use-gl=angle --use-angle="$ANGLE" --enable-gpu --ignore-gpu-blocklist \
+  --enable-gpu-rasterization ${OM_CHROMIUM_EXTRA_FLAGS:-} "${args[@]}"

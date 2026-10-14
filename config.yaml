@@ -25,6 +25,11 @@ output:
   default_fps: 30
   default_crf: 23
 
+gpu:
+  # GPU-first execution on the native runtime (gpu_native/README.md):
+  # auto = verified hardware by default with CPU fallback | cpu | require
+  mode: auto
+
 paths:
   pipeline_dir: pipeline
   library_dir: library

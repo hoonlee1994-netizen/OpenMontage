@@ -336,7 +336,13 @@ class RemotionCaptionBurn(BaseTool):
             "--codec=h264", "--crf=18",
             f"--output={str(Path(output_path).resolve())}",
         ]
-        self.run_command(render_cmd, cwd=str(root))
+        # GPU-first: Mali-rasterised Chromium + hardware encoder, with
+        # automatic CPU fallback (lib.gpu.remotion).
+        from lib.gpu import remotion as remotion_gpu
+
+        gpu_execution = remotion_gpu.run_render(
+            render_cmd, cwd=root, timeout=None, runner=self.run_command,
+        )
 
         if not Path(output_path).exists():
             return ToolResult(success=False, error="Remotion render produced no output")
@@ -351,6 +357,7 @@ class RemotionCaptionBurn(BaseTool):
                 "caption_count": len(captions),
                 "overlay_count": len(overlays or []),
                 "words_per_page": words_per_page,
+                "gpu_execution": gpu_execution,
             },
             artifacts=[output_path],
         )

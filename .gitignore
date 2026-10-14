@@ -104,3 +104,8 @@ venv/
 
 # Local Wan / diffusers GPU environment
 .venv-wan/
+
+# GPU-native runtime cache (downloaded Termux packages, build tools, SDK
+# headers). The runtime itself is installed outside the repo by
+# gpu_native/scripts/bootstrap_runtime.sh.
+gpu_native/.runtime/

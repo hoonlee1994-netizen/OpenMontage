@@ -54,6 +54,17 @@ class OutputConfig(BaseModel):
     default_crf: int = 23
 
 
+class GpuConfig(BaseModel):
+    """GPU-native execution policy (see lib/gpu/runtime.py).
+
+    auto    — GPU-first: verified hardware backends by default, CPU fallback
+    cpu     — never use the native GPU runtime
+    require — GPU or fail (acceptance testing)
+    """
+
+    mode: str = "auto"
+
+
 class PathsConfig(BaseModel):
     pipeline_dir: str = "pipeline"
     library_dir: str = "library"
@@ -70,6 +81,7 @@ class OpenMontageConfig(BaseModel):
     checkpoint: CheckpointConfig = Field(default_factory=CheckpointConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
     paths: PathsConfig = Field(default_factory=PathsConfig)
+    gpu: GpuConfig = Field(default_factory=GpuConfig)
 
     @classmethod
     def load(cls, config_path: Optional[Path] = None) -> "OpenMontageConfig":

@@ -113,6 +113,14 @@ class Upscale(BaseTool):
     # ------------------------------------------------------------------
 
     def get_status(self) -> ToolStatus:
+        # GPU-native path (ncnn/Vulkan on Mali) needs no PyTorch.
+        try:
+            from lib.gpu import superres
+
+            if superres.available("RealESRGAN_x4plus"):
+                return ToolStatus.AVAILABLE
+        except Exception:
+            pass
         try:
             from tools.enhancement._torchvision_compat import (
                 ensure_torchvision_compat,
@@ -155,11 +163,22 @@ class Upscale(BaseTool):
             return ToolResult(success=False, error=f"Input not found: {input_path}")
 
         is_video = input_path.suffix.lower() in VIDEO_EXTENSIONS
+        model_name = inputs.get("model", "RealESRGAN_x4plus")
+        face_enhance = inputs.get("face_enhance", False)
+
+        # GPU-first: Real-ESRGAN on ncnn/Vulkan (Mali) for the models that have
+        # an exact-weight ncnn conversion; PyTorch otherwise.
+        from lib.gpu import superres
+
+        use_gpu, gpu_reason = superres.gpu_support(model_name, face_enhance=face_enhance)
+        if use_gpu and not is_video:
+            use_gpu, gpu_reason = self._gpu_image_check(input_path, model_name, face_enhance)
 
         # Dependency preflight BEFORE creating any output directories/files.
-        preflight_error = self._preflight()
-        if preflight_error is not None:
-            return ToolResult(success=False, error=preflight_error)
+        if not use_gpu:
+            preflight_error = self._preflight()
+            if preflight_error is not None:
+                return ToolResult(success=False, error=f"{preflight_error} (GPU path: {gpu_reason})")
 
         if is_video and shutil.which("ffmpeg") is None:
             return ToolResult(
@@ -172,25 +191,50 @@ class Upscale(BaseTool):
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         scale = inputs.get("scale", 4)
-        model_name = inputs.get("model", "RealESRGAN_x4plus")
-        face_enhance = inputs.get("face_enhance", False)
         denoise_strength = inputs.get("denoise_strength", 0.5)
 
         start = time.time()
 
-        try:
-            if is_video:
-                result = self._upscale_video(
-                    input_path, output_path, scale, model_name,
-                    face_enhance, denoise_strength,
-                )
-            else:
-                result = self._upscale_image(
-                    input_path, output_path, scale, model_name,
-                    face_enhance, denoise_strength,
-                )
-        except Exception as e:
-            return ToolResult(success=False, error=f"Upscale failed: {e}")
+        gpu_failure = None
+        result = None
+        if use_gpu:
+            try:
+                if is_video:
+                    result = self._upscale_video_gpu(input_path, output_path, scale, model_name)
+                else:
+                    result = self._upscale_image_gpu(input_path, output_path, scale, model_name)
+            except Exception as e:
+                from lib.gpu import runtime as gpu_runtime
+
+                if gpu_runtime.mode() == "require":
+                    return ToolResult(success=False, error=f"GPU upscale failed (OM_GPU_MODE=require): {e}")
+                gpu_failure = str(e)
+                preflight_error = self._preflight()
+                if preflight_error is not None:
+                    return ToolResult(success=False, error=f"GPU upscale failed ({e}); CPU path unavailable: {preflight_error}")
+        if result is None:
+            from lib.gpu import runtime as gpu_runtime
+
+            if gpu_runtime.mode() == "require":
+                return ToolResult(success=False, error=f"OM_GPU_MODE=require but GPU upscale unavailable: {gpu_reason}")
+            try:
+                if is_video:
+                    result = self._upscale_video(
+                        input_path, output_path, scale, model_name,
+                        face_enhance, denoise_strength,
+                    )
+                else:
+                    result = self._upscale_image(
+                        input_path, output_path, scale, model_name,
+                        face_enhance, denoise_strength,
+                    )
+            except Exception as e:
+                return ToolResult(success=False, error=f"Upscale failed: {e}")
+            result["gpu_execution"] = {
+                "backend": "cpu",
+                "engine": "pytorch",
+                "fallback_reason": gpu_failure or gpu_reason,
+            }
 
         elapsed = time.time() - start
 
@@ -294,6 +338,92 @@ class Upscale(BaseTool):
             self.run_command(reassemble_cmd)
 
         return {"total_frames": total_frames, "fps": fps}
+
+    # ------------------------------------------------------------------
+    # GPU-native path (ncnn / Vulkan on the Mali GPU)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _gpu_image_check(input_path: Path, model_name: str, face_enhance: bool) -> tuple[bool, str]:
+        import cv2
+
+        from lib.gpu import superres
+
+        img = cv2.imread(str(input_path), cv2.IMREAD_UNCHANGED)
+        if img is None:
+            return False, f"could not read image {input_path}"
+        return superres.gpu_support(model_name, face_enhance=face_enhance, image=img)
+
+    @staticmethod
+    def _finish_scale(img, w_in: int, h_in: int, scale: int):
+        """Match RealESRGANer.enhance(outscale=...): x4 network, Lanczos to target."""
+        import cv2
+
+        if scale == 4:
+            return img
+        return cv2.resize(img, (int(w_in * scale), int(h_in * scale)), interpolation=cv2.INTER_LANCZOS4)
+
+    def _upscale_image_gpu(self, input_path: Path, output_path: Path, scale: int, model_name: str) -> dict[str, Any]:
+        import cv2
+
+        from lib.gpu import superres
+
+        src = cv2.imread(str(input_path), cv2.IMREAD_UNCHANGED)
+        h_in, w_in = src.shape[:2]
+        with tempfile.TemporaryDirectory(prefix="om-sr-") as tmp:
+            # ncnn reads 8-bit RGB PNG/JPG/WEBP; normalise grayscale inputs.
+            src_png = Path(tmp) / "in.png"
+            cv2.imwrite(str(src_png), cv2.cvtColor(src, cv2.COLOR_GRAY2BGR) if src.ndim == 2 else src)
+            raw = Path(tmp) / "out.png"
+            info = superres.run(src_png, raw, model_name)
+            out = cv2.imread(str(raw), cv2.IMREAD_UNCHANGED)
+            if src.ndim == 2:
+                out = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
+            out = self._finish_scale(out, w_in, h_in, scale)
+            if not cv2.imwrite(str(output_path), out):
+                raise RuntimeError(f"could not write {output_path}")
+        h, w = out.shape[:2]
+        return {"output_width": w, "output_height": h, "gpu_execution": info}
+
+    def _upscale_video_gpu(self, input_path: Path, output_path: Path, scale: int, model_name: str) -> dict[str, Any]:
+        from lib.gpu import superres
+
+        fps = self._get_video_fps(input_path)
+        with tempfile.TemporaryDirectory(prefix="om-sr-") as tmpdir:
+            frames_dir = Path(tmpdir) / "frames"
+            upscaled_dir = Path(tmpdir) / "upscaled"
+            frames_dir.mkdir()
+            upscaled_dir.mkdir()
+            self.run_command([
+                "ffmpeg", "-y", "-i", str(input_path), str(frames_dir / "frame_%06d.png"),
+            ])
+            total_frames = len(list(frames_dir.glob("*.png")))
+            if total_frames == 0:
+                raise RuntimeError("no frames extracted")
+            # One process for the whole batch: the model is loaded once and
+            # PNG load/save overlaps with GPU inference.
+            info = superres.run(frames_dir, upscaled_dir, model_name, threads=superres.threads_for_frames())
+            produced = len(list(upscaled_dir.glob("*.png")))
+            if produced != total_frames:
+                raise RuntimeError(f"GPU upscaled {produced}/{total_frames} frames")
+            vf = []
+            if scale != 4:
+                # Same Lanczos resampling RealESRGANer applies for outscale != 4.
+                vf = ["-vf", f"scale=iw*{scale}/4:ih*{scale}/4:flags=lanczos"]
+            self.run_command([
+                "ffmpeg", "-y",
+                "-framerate", str(fps),
+                "-i", str(upscaled_dir / "frame_%06d.png"),
+                "-i", str(input_path),
+                "-map", "0:v",
+                "-map", "1:a?",
+                *vf,
+                "-c:v", "libx264", "-crf", "18",
+                "-c:a", "copy",
+                "-pix_fmt", "yuv420p",
+                str(output_path),
+            ])
+        return {"total_frames": total_frames, "fps": fps, "gpu_execution": info}
 
     # ------------------------------------------------------------------
     # Helpers

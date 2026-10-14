@@ -179,8 +179,23 @@ def test_upscale_status_checks_real_execution_imports(monkeypatch):
         monkeypatch.delitem(sys.modules, key, raising=False)
     monkeypatch.setitem(sys.modules, "basicsr.archs.rrdbnet_arch", None)
 
+    # Without the GPU-native backend the PyTorch imports decide availability.
+    from lib.gpu import superres
+
+    monkeypatch.setattr(superres, "available", lambda model_name: False)
     tool = Upscale()
     assert tool.get_status() == ToolStatus.UNAVAILABLE
+
+
+def test_upscale_status_available_via_gpu_backend_without_pytorch(monkeypatch):
+    """The ncnn/Vulkan backend runs the default model without basicsr/torch."""
+    from tools.base_tool import ToolStatus
+    from tools.enhancement.upscale import Upscale
+    from lib.gpu import superres
+
+    monkeypatch.setitem(sys.modules, "basicsr.archs.rrdbnet_arch", None)
+    monkeypatch.setattr(superres, "available", lambda model_name: model_name == "RealESRGAN_x4plus")
+    assert Upscale().get_status() == ToolStatus.AVAILABLE
 
 
 def test_face_restore_status_checks_real_execution_imports(monkeypatch):

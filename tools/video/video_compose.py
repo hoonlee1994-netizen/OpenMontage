@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import unquote, urlsplit
 
+from lib.gpu import remotion as remotion_gpu
 from tools.base_tool import (
     BaseTool,
     Determinism,
@@ -505,6 +506,7 @@ class VideoCompose(BaseTool):
         temp_dir = output_path.parent / ".compose_tmp"
         temp_dir.mkdir(parents=True, exist_ok=True)
         temp_segments: list[Path] = []
+        segment_cmds: list[list[str]] = []
         concat_path: Path | None = None
         concat_out: Path | None = None
 
@@ -631,9 +633,35 @@ class VideoCompose(BaseTool):
                         ])
 
                     cmd.append(str(seg_path))
-                    self.run_command(cmd)
+                    segment_cmds.append(cmd)
 
                 temp_segments.append(seg_path)
+
+            # Segments are independent. On the GPU path each one is encoded by
+            # the hardware encoder with ~1-2 CPU cores of decode/filter work,
+            # so they run concurrently; on the CPU path libx264 already uses
+            # every core and they stay sequential.
+            from lib.gpu import runtime as gpu_runtime
+
+            workers = min(gpu_runtime.media_parallelism(), max(1, len(segment_cmds)))
+            if workers <= 1:
+                for seg_cmd in segment_cmds:
+                    self.run_command(seg_cmd)
+            else:
+                from concurrent.futures import ThreadPoolExecutor
+
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    # list() re-raises the first failure after all finish, so
+                    # the finally-block cleanup never races a running encode.
+                    futures = [pool.submit(self.run_command, c) for c in segment_cmds]
+                    errors = []
+                    for fut in futures:
+                        try:
+                            fut.result()
+                        except Exception as exc:  # noqa: BLE001
+                            errors.append(exc)
+                    if errors:
+                        raise errors[0]
 
             # Step 2: Concat segments
             concat_path = temp_dir / "concat_list.txt"
@@ -1045,8 +1073,12 @@ class VideoCompose(BaseTool):
 
         try:
             # Run from inside the composer dir so npx resolves the local
-            # remotion binary (mirrors _remotion_render).
-            self.run_command(cmd, timeout=1800, cwd=composer_dir)
+            # remotion binary (mirrors _remotion_render). GPU-first: Chromium
+            # rasterises on the Mali GPU and frames are encoded by the
+            # hardware encoder, with automatic CPU fallback (lib.gpu.remotion).
+            gpu_execution = remotion_gpu.run_render(
+                cmd, cwd=composer_dir, timeout=1800, runner=self.run_command,
+            )
         except Exception as e:
             return ToolResult(success=False, error=f"Atelier (bespoke) Remotion render failed: {e}")
 
@@ -1096,6 +1128,7 @@ class VideoCompose(BaseTool):
             "output": str(output_path),
             "final_review": final_review,
             "final_review_status": final_review.get("status"),
+            "gpu_execution": gpu_execution,
         }
 
         if final_review.get("status") == "fail":
@@ -2091,7 +2124,13 @@ class VideoCompose(BaseTool):
             # local remotion binary via node_modules/.bin. Without this,
             # Windows npx cannot locate the CLI and returns "could not
             # determine executable to run".
-            self.run_command(cmd, timeout=subprocess_timeout, cwd=composer_dir)
+            #
+            # GPU-first: the frames are rasterised by Chromium on the Mali GPU
+            # and encoded by the MediaCodec hardware encoder; a failed GPU
+            # render is retried on the CPU path (lib.gpu.remotion).
+            gpu_execution = remotion_gpu.run_render(
+                cmd, cwd=composer_dir, timeout=subprocess_timeout, runner=self.run_command,
+            )
         except subprocess.CalledProcessError as e:
             # run_command uses check=True + capture_output, so the useful
             # Remotion diagnostics live in stderr/stdout — surface the tail
@@ -2131,6 +2170,7 @@ class VideoCompose(BaseTool):
                 "output": str(output_path),
                 "profile": profile_name,
                 "staged_media_count": staged_count,
+                "gpu_execution": gpu_execution,
             },
             artifacts=[str(output_path)],
         )

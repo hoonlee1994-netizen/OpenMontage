@@ -4,6 +4,8 @@
 分支：`feat/gpu-native-openmontage`（仅本地提交，未推送）　证据目录：`gpu_native/bench/results/`
 
 > 结论先行：GPU/硬件优先已成为默认执行架构，并在真实 Mali GPU 与 MediaTek 硬件编码器上验证。主要生产路径（Remotion 渲染、全部 H.264/HEVC 编码、超分辨率、合成调度）均已迁移；剩余 CPU 工作负载均有实测或正确性依据。本次新增**免 proot 执行通道**（由 Termux 应用经服务 intent 派生 worker，**不需要 `allow-external-apps`、不改动任何 Android 设置**），在独占硬件编码上取得 **1.22×** 且输出**逐字节一致**；并行与流式作业实测无收益，故按独占门控启用。状态判定为 **PARTIAL**（理由见第 9 节）。
+>
+> **L5 修复（2026-10-14）**：针对独立 GPT-6.1 L5 验收提出的三个阻断项——**M1** 未显式 `-pix_fmt` 时的静默位深/色度降级与错误容器隐式编码器假设、**M2** 硬件编码器孤儿与输出所有权、**M3** 免 PRoot 路径字体命名空间不等价导致字幕变方框——已全部修复并通过前后实测验证。根因、前/后复现、回归测试与剩余不确定性见 **`gpu_native/REMEDIATION.zh-CN.md`**（修复提交 `a6bbb27`）。本报告不主张独立 L5 通过。
 
 ---
 
@@ -165,6 +167,8 @@ proot 会追踪其下**每个**进程，因此每次原生 FFmpeg 启动都要�
 | 音频（混音、AAC、atempo、响度） | **技术适配性** | 计算量小，无 GPU 收益 |
 | Remotion 中的 JS/React/布局、截图 JPEG 编码、CDP 传输、OffthreadVideo 抽帧（Rust 合成器） | **技术适配性 / 缺少硬件实现** | 浏览器主线程工作本质为 CPU；合成器是 glibc 进程无法使用硬件解码器 |
 | 无损、4:4:4、10-bit、强制关键帧、非整秒 GOP、VP9/AV1 编码 | **技术适配性 / 缺少硬件实现** | 硬件编码器不支持或会改变输出契约；AV1 编码器本身是软件实现 |
+| 未显式指定输出 `-pix_fmt` 的工具（`color_grade`、`eye_enhance`、`face_enhance`、`auto_reframe`、`silence_cutter`、`video_trimmer` 等；`video_compose`/`video_stitch` 仅其无 `-pix_fmt` 的分支） | **正确性（L5-M1）** | 无显式 `-pix_fmt` 时无法确证位深/色度等价，硬件只输出 8-bit 4:2:0；改为保留原 CPU 命令，避免静默降级 |
+| 字幕 / ASS / drawtext 等文字栅格化命令 | **兼容性（L5-M3）** | 免 PRoot worker 不可见 Debian 字体栈；路由到受追踪原生路径（仍走硬件编码，字体选择与 CPU 一致） |
 | GFPGAN、RealESRNet、rembg、Whisper、Piper、OpenCV 人脸/眼部/抠像 | **缺少硬件实现** | 本环境无 PyTorch/ONNX Runtime 的 Mali 后端；转换为 ncnn 会改变已批准模型的实现，需单独批准与验证 |
 
 ## 8. 局限（未夸大）
@@ -184,10 +188,12 @@ proot 会追踪其下**每个**进程，因此每次原生 FFmpeg 启动都要�
 已完成并验证：GPU 优先为默认（A）、三类真实硬件执行证据（B）、CPU/GPU 对比与端到端结果（C）、功能/质量/同步兼容（D）、无人值守可靠性与故障注入（E）、CPU 例外逐项说明（F）；另新增**免 proot 执行通道**（服务 intent，不改 Android 设置），在独占硬件编码上取得 **1.22×**、输出**逐字节一致**（G）。
 未闭合：调色的 GPU 等价实现（正确性阻碍）、HyperFrames 的 GPU 浏览器验证（未安装）、proot 开销在并行批次与流式管道作业上的消除（受“应用派生进程只能用 0–3 核”的限制，需 Android 状态变更）。因此不报告为 COMPLETE。
 
+**L5 修复（`a6bbb27`）后的状态变化**：三个阻断项已闭合，GPU 优先默认与硬件路径、CPU 回退均保持；其中 M1 使“未显式 `-pix_fmt`”的工作负载按正确性保留在 CPU（见第 7 节新增行），M3 使文字栅格化命令走受追踪原生路径（仍硬件编码）。状态仍为 **PARTIAL**，但不再包含上述三项阻断。详见 `gpu_native/REMEDIATION.zh-CN.md`。
+
 ## 10. 仓库状态、测试与复现
 
-- 分支 `feat/gpu-native-openmontage`；提交与 diff：`git log c135813..HEAD`、`git diff c135813..HEAD --stat`。
-- 测试：新增 `tests/lib/test_gpu_ffmpeg_args.py`、`test_gpu_dispatch_safety.py`、`test_gpu_remotion_runner.py`、`test_gpu_oop.py`（命名空间映射与 worker 生命周期，14 项）；本次复跑 GPU 层 4 个文件共 **60 项全部通过**（`.venv/bin/python -m pytest -q tests/lib/test_gpu_oop.py tests/lib/test_gpu_ffmpeg_args.py tests/lib/test_gpu_dispatch_safety.py tests/lib/test_gpu_remotion_runner.py`）；全量回归结果见第 5 节。
+- 分支 `feat/gpu-native-openmontage`；提交与 diff：`git log c135813..HEAD`、`git diff c135813..HEAD --stat`。L5 修复提交：`a6bbb27`（父 `585eed3`）。
+- 测试：新增 `tests/lib/test_gpu_ffmpeg_args.py`、`test_gpu_dispatch_safety.py`、`test_gpu_remotion_runner.py`、`test_gpu_oop.py`（命名空间映射与 worker 生命周期，14 项）；L5 修复后复跑 GPU 层 4 个文件共 **80 项全部通过**（`.venv/bin/python -m pytest -q tests/lib/test_gpu_oop.py tests/lib/test_gpu_ffmpeg_args.py tests/lib/test_gpu_dispatch_safety.py tests/lib/test_gpu_remotion_runner.py`）；全量 `pytest tests/ -q` 为 **2075 passed, 11 skipped, 3 xfailed**。
 - 复现：`bash gpu_native/scripts/bootstrap_runtime.sh && bash gpu_native/scripts/bootstrap_browser.sh`；证据：`python gpu_native/tools/collect_evidence.py <dir>`；基准：`gpu_native/bench/final_suite.py`、`parity_matrix.py`、`soak.py`；免 proot A/B：`gpu_native/bench/oop_ab.py`（交错、中位数）与 `oop_bench.py`（每次启动开销），结果见 `results/proot_free_ab.json`。
 - 新增环境开关：`OM_GPU_OOP`（默认 `auto`；`0`/`off` 关闭）、`OM_GPU_OOP_WAIT_S`（默认 2.5）、`OM_GPU_OOP_TIMEOUT_S`（默认 3600）。所有开关只影响本工程的执行路径选择，不改变任何输出契约。
 - Develop Record：`DEVELOP_RECORD = REQUIRED`，但 openmontage 无受治理绑定（候选为无关项目）；按协议未创建项目/模块/Slice，**本次未写入开发记录**。

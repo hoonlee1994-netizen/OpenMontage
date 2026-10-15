@@ -133,11 +133,40 @@ worker's cpuset penalty offsets the saving — measured 0.95×, no gain.
 
 * `OM_GPU_MODE` (or `gpu.mode` in `config.yaml`): `auto` (default) | `cpu` |
   `require`. `require` never falls back — use it for acceptance runs.
-* FFmpeg jobs: GPU output is validated (stream present, dimensions); on
-  failure the *unmodified* CPU command is re-run. Only files the failed GPU
-  attempt created or rewrote are removed; pre-existing outputs are never
-  touched. Commands reading stdin / writing stdout cannot be replayed and run
-  without fallback while the backend is healthy.
+* FFmpeg jobs: the translation keeps FFmpeg's option semantics (the effective
+  video codec is the *last* codec option whose stream specifier matches the
+  video stream, rewritten in place; specifiers it cannot resolve statically —
+  `-c:0`, `-c:v:1`, `-c:m:…` — keep the original CPU command). GPU output is
+  validated before it is published: a stream with the requested codec family in
+  8-bit 4:2:0 (`ffprobe`), not just "has dimensions"; a file that is something
+  else is discarded and the *unmodified* CPU command is re-run (`require`
+  fails instead). The telemetry names what the published file really is
+  (`verified: {path: "hevc/yuv420p"}`; outputs left on the software encoder are
+  listed in `software_outputs`). Commands reading stdin / writing stdout cannot
+  be replayed and run without fallback while the backend is healthy.
+* Output ownership: destinations are resolved the way FFmpeg opens them — a
+  `file:` URL is the plain path, a symlink is followed to the file it writes,
+  an extension-inferred muxer (`.m3u8`, `.mpd`) is the same multi-file muxer as
+  `-f hls`/`-f dash`. Every file output of an accelerated command is staged
+  beside its destination and published together, only after the attempt
+  succeeded and validated; a failed, cancelled or abandoned attempt never
+  touches a pre-existing file. A destination that cannot be owned (numbered
+  pattern, multi-file muxer, sidecar-writing option, `tee:`/`md5:` protocols,
+  two spellings of one file, an output that is also an input) makes the
+  dispatcher refuse the command with `rc=78` before anything is written.
+* A command with nothing to accelerate is exec'd untouched — except when it
+  would overwrite an existing regular file (`-y` over a production file): it
+  then runs as an owned child on the CPU FFmpeg, writing a staged temp that
+  replaces the file only on success (about 0.1 s of supervision overhead).
+  Hard-linked outputs are replaced at their own path (other links keep the old
+  content); a writable file in an unwritable directory is written in place as
+  before.
+* Deliverable renders: a Remotion render (`lib/gpu/remotion.run_render(...,
+  output=)`) or an FFmpeg compose step that is about to overwrite an existing
+  file renders each attempt (GPU, then the CPU redo of a degraded/failed one)
+  into its own hidden sibling and publishes only the verified attempt
+  (`lib/gpu/delivery.py`). A render to a path that does not exist yet is
+  written directly.
 * Remotion: a render whose GPU process falls back to `--use-gl=disabled`
   mid-render is detected (`/proc` command line of that render's GPU process)
   and redone on the CPU path instead of shipping possibly incomplete frames.

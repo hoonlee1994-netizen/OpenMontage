@@ -1,6 +1,7 @@
 """Data-safety rules of the GPU-first ffmpeg dispatcher's CPU fallback."""
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
@@ -9,21 +10,17 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from lib.gpu import ffmpeg_exec
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _plan(target):
-    return SimpleNamespace(target=target)
-
-
-def test_stage_outputs_rewrites_to_a_sibling_temp_with_same_extension(tmp_path):
+def test_stage_cmd_rewrites_to_a_sibling_temp_with_same_extension(tmp_path):
     final = str(tmp_path / "out.mp4")
     cmd = ["-y", "-i", "in.mp4", "-c:v", "h264_mediacodec", final]
-    staged = ffmpeg_exec._stage_outputs(cmd, [_plan(final)])
-    assert staged is not None
-    staged_cmd, pairs = staged
+    staged_cmd, pairs = ffmpeg_exec._stage_cmd(cmd, [final], has_y=True)
     assert len(pairs) == 1 and pairs[0][0] == final
     temp = pairs[0][1]
     assert temp != final
@@ -32,34 +29,38 @@ def test_stage_outputs_rewrites_to_a_sibling_temp_with_same_extension(tmp_path):
     assert staged_cmd[-1] == temp and final not in staged_cmd
 
 
-def test_stage_outputs_refuses_existing_file_without_overwrite_flag(tmp_path):
+def test_stage_cmd_refuses_existing_file_without_overwrite_flag(tmp_path):
     final = tmp_path / "out.mp4"
     final.write_bytes(b"precious")
     # No -y: ffmpeg would refuse to overwrite; staging must not fake success.
-    assert ffmpeg_exec._stage_outputs(["-i", "in.mp4", str(final)], [_plan(str(final))]) is None
+    with pytest.raises(ffmpeg_exec._CannotStage) as exc:
+        ffmpeg_exec._stage_cmd(["-i", "in.mp4", str(final)], [str(final)], has_y=False)
+    assert exc.value.kind == "overwrite"
 
 
-def test_stage_outputs_allows_existing_file_with_yes(tmp_path):
+def test_stage_cmd_allows_existing_file_with_yes(tmp_path):
     final = tmp_path / "out.mp4"
     final.write_bytes(b"old")
-    staged = ffmpeg_exec._stage_outputs(["-y", "-i", "in.mp4", str(final)], [_plan(str(final))])
-    assert staged is not None and staged[1][0][0] == str(final)
+    _cmd, pairs = ffmpeg_exec._stage_cmd(["-y", "-i", "in.mp4", str(final)], [str(final)], has_y=True)
+    assert pairs[0][0] == str(final)
 
 
-def test_stage_outputs_skips_pipe_targets(tmp_path):
-    assert ffmpeg_exec._stage_outputs(["-i", "in.mp4", "pipe:1"], [_plan("pipe:1")]) is None
+def test_stage_cmd_leaves_pipe_targets_alone(tmp_path):
+    staged_cmd, pairs = ffmpeg_exec._stage_cmd(["-i", "in.mp4", "pipe:1"], ["pipe:1"], has_y=False)
+    assert pairs == [] and staged_cmd[-1] == "pipe:1"
 
 
-def test_stage_outputs_returns_none_when_target_token_is_absent(tmp_path):
+def test_stage_cmd_refuses_a_target_token_it_cannot_find(tmp_path):
     final = str(tmp_path / "out.mp4")
-    assert ffmpeg_exec._stage_outputs(["-y", "-i", "in.mp4", "other.mp4"], [_plan(final)]) is None
+    with pytest.raises(ffmpeg_exec._CannotStage) as exc:
+        ffmpeg_exec._stage_cmd(["-y", "-i", "in.mp4", "other.mp4"], [final], has_y=True)
+    assert exc.value.kind == "absent"
 
 
 def test_commit_publishes_atomically_and_discard_leaves_no_trace(tmp_path):
     final = tmp_path / "out.mp4"
     final.write_bytes(b"old")
-    staged = ffmpeg_exec._stage_outputs(["-y", "-i", "in.mp4", str(final)], [_plan(str(final))])
-    _cmd, pairs = staged
+    _cmd, pairs = ffmpeg_exec._stage_cmd(["-y", "-i", "in.mp4", str(final)], [str(final)], has_y=True)
     temp = pairs[0][1]
     with open(temp, "wb") as fh:
         fh.write(b"new-and-valid")
@@ -70,8 +71,7 @@ def test_commit_publishes_atomically_and_discard_leaves_no_trace(tmp_path):
 def test_discarded_attempt_never_touches_the_final_output(tmp_path):
     final = tmp_path / "user.mp4"
     final.write_bytes(b"asset")
-    staged = ffmpeg_exec._stage_outputs(["-y", "-i", "in.mp4", str(final)], [_plan(str(final))])
-    _cmd, pairs = staged
+    _cmd, pairs = ffmpeg_exec._stage_cmd(["-y", "-i", "in.mp4", str(final)], [str(final)], has_y=True)
     with open(pairs[0][1], "wb") as fh:
         fh.write(b"partial garbage")
     ffmpeg_exec._discard_outputs(pairs)
@@ -82,8 +82,8 @@ def test_discarded_attempt_never_touches_the_final_output(tmp_path):
 def test_each_attempt_uses_a_distinct_temp(tmp_path):
     final = str(tmp_path / "out.mp4")
     cmd = ["-y", "-i", "in.mp4", final]
-    first = ffmpeg_exec._stage_outputs(cmd, [_plan(final)])[1][0][1]
-    second = ffmpeg_exec._stage_outputs(cmd, [_plan(final)])[1][0][1]
+    first = ffmpeg_exec._stage_cmd(cmd, [final], has_y=True)[1][0][1]
+    second = ffmpeg_exec._stage_cmd(cmd, [final], has_y=True)[1][0][1]
     assert first != second  # a retry can never race the previous writer
 
 
@@ -308,19 +308,25 @@ class _Slot:
 
 
 def _wire_dispatch(monkeypatch, targets, *, gpu_rc=1, cpu_rc=0,
-                   gpu_writes=True, cpu_writes=True):
-    """Point dispatch at a fake capability layer whose hardware path fails."""
+                   gpu_writes=True, cpu_writes=True, yes=True,
+                   reads_stdin=False, writes_stdout=False, argv=None):
+    """Point dispatch at a fake capability layer whose hardware path fails.
+
+    ``targets`` names the video outputs (one GPU plan each); ``argv`` overrides
+    the command line for mixed-output and streaming cases.
+    """
     from lib.gpu import ffmpeg_args, oop, runtime, telemetry
 
     calls = {}
     plans = [SimpleNamespace(target=str(t), action="gpu", hw_codec="h264", reason="")
              for t in targets]
-    argv = ["-y", "-i", "in.mp4"]
-    for t in targets:
-        argv += ["-t", "1", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(t)]
-    gpu_argv = ["-y", "-i", "in.mp4"]
-    for t in targets:
-        gpu_argv += ["-t", "1", "-c:v", "h264_mediacodec", "-pix_fmt", "yuv420p", str(t)]
+    if argv is None:
+        argv = (["-y"] if yes else []) + ["-i", "in.mp4"]
+        for t in targets:
+            argv += ["-t", "1", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(t)]
+    else:
+        argv = list(argv)
+    gpu_argv = [a.replace("libx264", "h264_mediacodec") for a in argv]
 
     def write_temps(cmd, payload):
         for arg in cmd:
@@ -335,8 +341,8 @@ def _wire_dispatch(monkeypatch, targets, *, gpu_rc=1, cpu_rc=0,
     monkeypatch.setattr(ffmpeg_exec, "_reference_semantics", lambda path: "modern")
     monkeypatch.setattr(ffmpeg_args, "translate",
                         lambda a, **kw: (list(gpu_argv), list(plans)))
-    monkeypatch.setattr(ffmpeg_args, "reads_stdin", lambda a: False)
-    monkeypatch.setattr(ffmpeg_args, "writes_stdout", lambda a: False)
+    monkeypatch.setattr(ffmpeg_args, "reads_stdin", lambda a: reads_stdin)
+    monkeypatch.setattr(ffmpeg_args, "writes_stdout", lambda a: writes_stdout)
     monkeypatch.setattr(ffmpeg_args, "renders_text", lambda a: False)
     monkeypatch.setattr(runtime, "capabilities",
                         lambda: {"ok": True, "hw_encoders": {"h264": {}}})
@@ -450,11 +456,80 @@ def test_restage_is_skipped_when_no_remote_run_started(tmp_path, monkeypatch):
     assert code == 7 and not called  # nothing ran, so the target is reusable
 
 
-def test_dispatch_execs_directly_when_it_cannot_own_the_output(tmp_path, monkeypatch):
-    """An un-staged destination must not be run behind a recoverable probe."""
+# --- the complete output surface is owned (not just the GPU video outputs) ---
+
+def _mixed_argv(tmp_path, video_out):
+    """GPU video + stream-copy + audio outputs in one command."""
+    return ["-y", "-i", "in.mp4",
+            "-t", "1", "-c", "copy", str(tmp_path / "copied.mp4"),
+            "-t", "1", "-vn", "-c:a", "aac", str(tmp_path / "audio.m4a"),
+            "-t", "1", "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(video_out)]
+
+
+def test_dispatch_stages_every_file_output_of_a_mixed_command(tmp_path, monkeypatch):
+    """A failed stream-copy/audio output must not truncate an existing asset."""
+    copied = tmp_path / "copied.mp4"
+    copied.write_bytes(b"OLD-COPY")                     # the asset at risk
+    video = tmp_path / "video.mp4"
+    argv, calls = _wire_dispatch(monkeypatch, [video], gpu_rc=1, cpu_rc=1,
+                                 argv=_mixed_argv(tmp_path, video))
+    assert ffmpeg_exec.dispatch(argv) != 0
+    assert copied.read_bytes() == b"OLD-COPY"           # unchanged, not truncated
+    # Every output went to a temp, none of the three finals was written directly.
+    for final in (copied, tmp_path / "audio.m4a", video):
+        assert str(final) not in calls["native_cmd"]
+        assert str(final) not in calls["cpu_cmd"]
+    assert os.listdir(tmp_path) == [copied.name]        # no temps or backups left
+
+
+def test_dispatch_publishes_every_file_output_of_a_mixed_command(tmp_path, monkeypatch):
+    copied = tmp_path / "copied.mp4"
+    copied.write_bytes(b"OLD-COPY")
+    video = tmp_path / "video.mp4"
+    argv, _calls = _wire_dispatch(monkeypatch, [video], gpu_rc=1, cpu_rc=0,
+                                  argv=_mixed_argv(tmp_path, video))
+    assert ffmpeg_exec.dispatch(argv) == 0
+    for final in (copied, tmp_path / "audio.m4a", video):
+        assert final.read_bytes() == b"CPU-OUTPUT"      # all published together
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["audio.m4a", "copied.mp4", "video.mp4"]
+
+
+def test_dispatch_refuses_a_pattern_output_before_running_anything(tmp_path, monkeypatch):
+    """A numbered pattern cannot be owned, so nothing may run at all."""
+    video = tmp_path / "out.mp4"
+    argv, calls = _wire_dispatch(monkeypatch, [video], argv=[
+        "-y", "-i", "in.mp4", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(video),
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", str(tmp_path / "frame_%04d.png")])
+    assert ffmpeg_exec.dispatch(argv) == 78
+    assert "native_cmd" not in calls and "cpu_cmd" not in calls
+    assert os.listdir(tmp_path) == []                   # nothing written
+
+
+def test_dispatch_refuses_a_multi_file_muxer_output(tmp_path, monkeypatch):
+    video = tmp_path / "out.mp4"
+    argv, calls = _wire_dispatch(monkeypatch, [video], argv=[
+        "-y", "-i", "in.mp4", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(video),
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-f", "hls", str(tmp_path / "seg.m3u8")])
+    assert ffmpeg_exec.dispatch(argv) == 78
+    assert "native_cmd" not in calls and "cpu_cmd" not in calls
+    assert os.listdir(tmp_path) == []
+
+
+def test_dispatch_refuses_when_a_file_output_cannot_be_located(tmp_path, monkeypatch):
     final = tmp_path / "out.mp4"
     final.write_bytes(b"OLD-ASSET")
     argv, calls = _wire_dispatch(monkeypatch, [final], gpu_rc=1, cpu_rc=0)
+    monkeypatch.setattr(ffmpeg_exec, "_locate_output", lambda cmd, target: None)
+    assert ffmpeg_exec.dispatch(argv) == 78
+    assert "native_cmd" not in calls and "cpu_cmd" not in calls
+    assert final.read_bytes() == b"OLD-ASSET"
+
+
+def test_dispatch_execs_directly_when_ffmpeg_itself_refuses_the_overwrite(tmp_path, monkeypatch):
+    """No -y over an existing file: ffmpeg's own refuse semantics are preserved."""
+    final = tmp_path / "out.mp4"
+    final.write_bytes(b"OLD-ASSET")
+    argv, calls = _wire_dispatch(monkeypatch, [final], gpu_rc=1, cpu_rc=0, yes=False)
     execs = []
 
     def fake_exec(cmd, env):
@@ -462,11 +537,90 @@ def test_dispatch_execs_directly_when_it_cannot_own_the_output(tmp_path, monkeyp
         raise SystemExit(0)          # execve never returns
 
     monkeypatch.setattr(ffmpeg_exec, "_exec", fake_exec)
-    monkeypatch.setattr(ffmpeg_exec, "_stage_outputs", lambda cmd, plans: None)
     try:
         ffmpeg_exec.dispatch(argv)
     except SystemExit:
         pass
     assert execs and execs[0][0] == "/usr/bin/ffmpeg"
-    assert "cpu_cmd" not in calls         # no recoverable probe was started
+    assert str(final) in execs[0]
+    assert "native_cmd" not in calls and "cpu_cmd" not in calls  # no probe was started
     assert final.read_bytes() == b"OLD-ASSET"
+
+
+# --- a streaming command still owns its file outputs ------------------------
+
+def test_streaming_command_stages_its_file_output_and_keeps_pipe_semantics(tmp_path, monkeypatch):
+    final = tmp_path / "out.mp4"
+    final.write_bytes(b"OLD-ASSET")
+    argv, calls = _wire_dispatch(monkeypatch, [final], gpu_rc=1, cpu_rc=0, writes_stdout=True)
+    assert ffmpeg_exec.dispatch(argv) == 1                  # the hardware run failed
+    assert "cpu_cmd" not in calls                           # a consumed pipe has no fallback
+    assert calls["native_cmd"][-1] != str(final)            # staged, never written directly
+    assert final.read_bytes() == b"OLD-ASSET"               # the asset survived
+    assert os.listdir(tmp_path) == [final.name]             # no temp left behind
+
+
+def test_streaming_command_publishes_its_file_output_on_success(tmp_path, monkeypatch):
+    final = tmp_path / "out.mp4"
+    final.write_bytes(b"OLD-ASSET")
+    argv, calls = _wire_dispatch(monkeypatch, [final], gpu_rc=0, gpu_writes=True,
+                                 writes_stdout=True)
+    assert ffmpeg_exec.dispatch(argv) == 0
+    assert final.read_bytes() == b"GPU-OUTPUT"
+    assert os.listdir(tmp_path) == [final.name]
+
+
+# --- validation strength follows the output's media type ---------------------
+
+def _stub_ffprobe(monkeypatch, payload):
+    """Canned ffprobe that mirrors ``-select_streams v:0`` filtering."""
+    def run(cmd, **kwargs):
+        streams = payload.get("streams") or []
+        if "v:0" in cmd:
+            streams = [s for s in streams if s.get("codec_type") == "video"]
+        return SimpleNamespace(stdout=json.dumps({"streams": streams}))
+
+    monkeypatch.setattr(ffmpeg_exec, "Path", Path)
+    monkeypatch.setattr(ffmpeg_exec, "json", json)
+    monkeypatch.setattr(ffmpeg_exec, "_cpu_env", lambda: {})
+    monkeypatch.setattr(ffmpeg_exec, "subprocess", SimpleNamespace(run=run))
+
+
+def test_validate_accepts_an_audio_only_output_for_the_media_kind(tmp_path, monkeypatch):
+    f = tmp_path / "audio.m4a"
+    f.write_bytes(b"x")
+    _stub_ffprobe(monkeypatch, {"streams": [{"codec_type": "audio", "codec_name": "aac"}]})
+    assert ffmpeg_exec._validate([(str(f), "media")]) is None
+
+
+def test_validate_still_requires_a_video_stream_for_a_video_encode(tmp_path, monkeypatch):
+    f = tmp_path / "out.mp4"
+    f.write_bytes(b"x")
+    _stub_ffprobe(monkeypatch, {"streams": [{"codec_type": "audio", "codec_name": "aac"}]})
+    assert "no video stream" in ffmpeg_exec._validate([(str(f), "video")])
+
+
+def test_validate_rejects_a_media_file_with_no_stream(tmp_path, monkeypatch):
+    f = tmp_path / "out.mp4"
+    f.write_bytes(b"x")
+    _stub_ffprobe(monkeypatch, {"streams": []})
+    assert "no media stream" in ffmpeg_exec._validate([(str(f), "media")])
+
+
+def test_validate_never_probes_a_plain_file_output(tmp_path, monkeypatch):
+    f = tmp_path / "checksums.md5"
+    f.write_bytes(b"abc")
+
+    def _boom(*a, **k):  # pragma: no cover - must not be reached
+        raise AssertionError("a text/checksum output must not be ffprobed")
+
+    monkeypatch.setattr(ffmpeg_exec, "Path", Path)
+    monkeypatch.setattr(ffmpeg_exec, "subprocess", SimpleNamespace(run=_boom))
+    assert ffmpeg_exec._validate([(str(f), "file")]) is None
+
+
+def test_validate_rejects_an_empty_output(tmp_path):
+    ffmpeg_exec._load()
+    f = tmp_path / "out.mp4"
+    f.write_bytes(b"")
+    assert "missing or empty" in ffmpeg_exec._validate([(str(f), "media")])

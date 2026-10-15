@@ -18,17 +18,20 @@ Commands that read stdin or write stdout cannot be replayed after a partial
 run, so they take the GPU path only while the encoder backend is healthy and
 are exec'd without fallback.
 
-Output ownership: every attempt — the hardware encode *and* the CPU fallback —
-writes per-attempt temp files beside the final output and publishes them with
-one atomic, rollback-capable transaction, only after the attempt succeeded and
-its files validated. A failed, cancelled or orphaned encoder can therefore only
-ever write a discarded temp, never a production file, and two attempts never
-own the same destination at the same time. Each owned subprocess leads its own
-session and carries ``PR_SET_PDEATHSIG``, so it is stopped together with its
-process group and cannot outlive the dispatcher. When ownership cannot be
-guaranteed (an existing output without ``-y``, or an output token that cannot
-be located), the original command is exec'd directly rather than run behind a
-recoverable probe that could orphan a writer.
+Output ownership: the dispatcher first classifies the command's *complete*
+output surface (``lib.gpu.ffmpeg_args.own_outputs``, not only the translated
+video outputs). Every file output — GPU-encoded, stream-copied, audio, image or
+mixed — is staged per attempt beside its final path and published by one atomic,
+rollback-capable transaction, only after the attempt succeeded and its files
+validated. A failed, cancelled or orphaned encoder can therefore only ever write
+a discarded temp, never a production file, and two attempts never own the same
+destination at the same time. Each owned subprocess leads its own session and
+carries ``PR_SET_PDEATHSIG``, so it is stopped together with its process group
+and cannot outlive the dispatcher. A file output the dispatcher cannot own (a
+numbered pattern or a multi-file muxer) makes it refuse the whole command before
+anything runs, rather than leave an unowned writer on a production asset. When
+staging cannot be guaranteed for an existing output without ``-y``, the original
+command is exec'd directly so ffmpeg's own refuse/prompt semantics are preserved.
 """
 from __future__ import annotations
 
@@ -130,27 +133,50 @@ def _write_err(data: bytes) -> None:
 
 
 def _validate(outputs: list) -> "str | None":
-    """Return an error string if any produced file is unusable."""
-    for out in outputs:
-        p = Path(out)
+    """Return an error string if any produced file is unusable.
+
+    ``outputs`` is a list of ``(path, kind)`` pairs. ``kind`` selects the check
+    that matches the output's media type: ``"video"`` requires a video stream
+    with dimensions (every output produced by a video encode, hardware or CPU),
+    ``"media"`` requires at least one stream (audio, image, stream copy or a
+    mixed muxer), and ``"file"`` only requires a non-empty file (text, checksum
+    and metadata muxers carry no media stream to probe).
+    """
+    for path, kind in outputs:
+        p = Path(path)
         if not p.is_file() or p.stat().st_size == 0:
-            return f"output missing or empty: {out}"
+            return f"output missing or empty: {path}"
+        if kind == "file":
+            continue
+        probe = ["ffprobe", "-v", "error"]
+        if kind == "video":
+            probe += ["-select_streams", "v:0"]
+        probe += ["-show_entries", "stream=codec_type,codec_name,width,height:format=duration",
+                  "-of", "json", path]
         try:
-            proc = subprocess.run(
-                ["ffprobe", "-v", "error", "-select_streams", "v:0",
-                 "-show_entries", "stream=codec_name,width,height:format=duration",
-                 "-of", "json", out],
-                capture_output=True, text=True, timeout=60, env=_cpu_env(),
-            )
+            proc = subprocess.run(probe, capture_output=True, text=True, timeout=60, env=_cpu_env())
             data = json.loads(proc.stdout or "{}")
         except Exception as exc:
-            return f"ffprobe failed on {out}: {exc}"
+            return f"ffprobe failed on {path}: {exc}"
         streams = data.get("streams") or []
-        if not streams:
-            return f"no video stream in {out}"
-        if not streams[0].get("width"):
-            return f"video stream without dimensions in {out}"
+        if kind == "video":
+            if not streams:
+                return f"no video stream in {path}"
+            if not streams[0].get("width"):
+                return f"video stream without dimensions in {path}"
+        elif not streams:
+            return f"no media stream in {path}"
     return None
+
+
+def _staged_media(pairs: list, media: dict) -> list:
+    """Pair each staged temp with the validation strength of its destination."""
+    return [(temp, media.get(final, "media")) for final, temp in pairs]
+
+
+def _declared_media(paths: list, media: dict) -> list:
+    """Pair file outputs directly with their validation strength (no staging)."""
+    return [(path, media.get(path, "media")) for path in paths]
 
 
 def _snapshot(paths: list) -> dict:
@@ -188,7 +214,16 @@ def _temp_path(final: str) -> str:
 
 
 class _CannotStage(Exception):
-    """The dispatcher cannot take ownership of a required file output."""
+    """The dispatcher cannot take ownership of a required file output.
+
+    ``kind`` distinguishes a destination ffmpeg itself would refuse to write
+    (``"overwrite"``: an existing target with no ``-y``) from one that cannot be
+    identified in the command line at all (``"absent"``).
+    """
+
+    def __init__(self, message: str, kind: str = "absent"):
+        super().__init__(message)
+        self.kind = kind
 
 
 def _locate_output(cmd: list, final: str) -> "int | None":
@@ -213,8 +248,9 @@ def _stage_cmd(cmd: list, targets: list, *, has_y: bool) -> "tuple[list, list]":
 
     Returns ``(staged_cmd, [(final, temp), ...])`` or raises ``_CannotStage``
     when ownership cannot be guaranteed: an existing output without ``-y``
-    (refuse/prompt semantics must be preserved) or a target that does not
-    appear as an output token.
+    (ffmpeg's refuse/prompt semantics must be preserved) or a target that does
+    not appear as an output token. Callers pass *every* file output of the
+    command, so one transaction owns the command's complete output surface.
     """
     staged = list(cmd)
     pairs = []
@@ -222,37 +258,36 @@ def _stage_cmd(cmd: list, targets: list, *, has_y: bool) -> "tuple[list, list]":
         if ffmpeg_args.is_pipe(final):
             continue
         if not has_y and os.path.exists(final):
-            raise _CannotStage(f"{final} exists and the command has no -y")
+            raise _CannotStage(f"{final} exists and the command has no -y", "overwrite")
         idx = _locate_output(staged, final)
         if idx is None:
-            raise _CannotStage(f"output token not found in command: {final}")
+            raise _CannotStage(f"output token not found in command: {final}", "absent")
         temp = _temp_path(final)
         staged[idx] = temp
         pairs.append((final, temp))
     return staged, pairs
 
 
-def _stage_outputs(cmd: list, gpu_plans: list) -> "tuple[list, list] | None":
-    """Redirect GPU file outputs to per-attempt temp files in the same directory.
+def _unowned_staging(exc: _CannotStage, cpu_cmd: list, outputs: list) -> int:
+    """Resolve a destination the dispatcher could not stage.
 
-    The hardware attempt then can never overwrite a user's file directly, and a
-    failed or orphaned encoder leaves only a temp path that the *next* attempt
-    does not reuse (so a retry can never race a live writer on the real output).
-    The temps are published with an atomic ``os.replace`` only after they
-    validate; any failure discards them and leaves the original untouched.
-
-    Returns ``(staged_cmd, [(final, temp), ...])``, or ``None`` when the command
-    must not be staged — an existing output without ``-y`` (refuse/prompt
-    semantics must be preserved) or an output token that cannot be located.
+    When ffmpeg itself would refuse the write (an existing target without
+    ``-y``) the original command is exec'd, exactly as it was before staging
+    existed: this process *is* the single writer, so ffmpeg's own refuse/prompt
+    semantics are preserved. Any other cause means the destination could not be
+    identified, which must fail before an unowned writer (or a CPU fallback)
+    touches a production asset.
     """
-    targets = [p.target for p in gpu_plans]
-    try:
-        staged, pairs = _stage_cmd(cmd, targets, has_y="-y" in cmd)
-    except _CannotStage:
-        return None
-    if not pairs:
-        return None
-    return staged, pairs
+    if exc.kind == "overwrite":
+        telemetry.record({"kind": "job", "op": "ffmpeg", "backend": "cpu",
+                          "fallback_reason": "output ownership unavailable; running unaccelerated",
+                          "output": ",".join(outputs)})
+        _exec(cpu_cmd, _cpu_env())  # never returns
+    sys.stderr.write(f"[openmontage-gpu] refusing to run: cannot take ownership of {exc}; "
+                     "nothing was written\n")
+    telemetry.record({"kind": "job", "op": "ffmpeg", "backend": "gpu-failed",
+                      "fallback_reason": str(exc), "output": ",".join(outputs)})
+    return 78
 
 
 def _commit_outputs(pairs: list) -> "str | None":
@@ -621,11 +656,51 @@ def dispatch(argv: list[str]) -> int:
                                   "output": ",".join(p.target for p in gpu_plans)})
                 _exec(cpu_cmd, _cpu_env())
 
+            # The complete output contract of the command, not only the
+            # translated video outputs: every file the command writes must be
+            # owned by an attempt, or the command must not run at all. An
+            # output the dispatcher cannot own (a numbered pattern or a
+            # multi-file muxer) is refused *before* anything runs, never left to
+            # an unowned writer.
+            ownership = ffmpeg_args.own_outputs(argv)
+            unownable = [o for o in ownership if o.kind == "unsafe"]
+            if unownable:
+                detail = "; ".join(f"{o.target} ({o.reason})" for o in unownable)
+                sys.stderr.write("[openmontage-gpu] refusing to run: cannot take ownership of every "
+                                 f"file output ({detail}); nothing was written\n")
+                telemetry.record({"kind": "job", "op": "ffmpeg", "backend": "gpu-failed",
+                                  "fallback_reason": f"unownable file output: {detail}",
+                                  "output": ",".join(o.target for o in unownable)})
+                return 78
+            file_outs = [o for o in ownership if o.kind == "file"]
+            file_outputs = [o.target for o in file_outs]
+            media = {o.target: o.media for o in file_outs}
+
             if streaming:
-                # Cannot replay a consumed pipe: run on hardware, no fallback.
-                rc, _ = _run_native(native_cmd, capture_stderr=False, allow_remote=False)
+                # A consumed pipe cannot be replayed, so the hardware run has no
+                # fallback. Its file outputs are still staged and published, so a
+                # failed or cancelled run cannot leave a half-written production
+                # file behind; the pipes themselves are never staged.
+                try:
+                    run_cmd, staged_pairs = _stage_cmd(native_cmd, file_outputs,
+                                                       has_y="-y" in native_cmd)
+                except _CannotStage as exc:
+                    return _unowned_staging(exc, cpu_cmd, file_outputs)
+                rc, _ = _run_native(run_cmd, capture_stderr=False, allow_remote=False)
                 if _cancelled():
+                    _discard_outputs(staged_pairs)
                     return _die_by_signal(_cancelled())
+                if rc == 0 and staged_pairs:
+                    problem = _validate(_staged_media(staged_pairs, media))
+                    if problem is None:
+                        problem = _commit_outputs(staged_pairs)
+                    if problem is not None:
+                        _discard_outputs(staged_pairs)
+                        sys.stderr.write(f"[openmontage-gpu] streaming output could not be published: "
+                                         f"{problem}\n")
+                        rc = 1
+                else:
+                    _discard_outputs(staged_pairs)
                 runtime.record_outcome(BACKEND, rc == 0, f"exit {rc}")
                 telemetry.record({"kind": "job", "op": "ffmpeg", "backend": "gpu" if rc == 0 else "gpu-failed",
                                   "encoder": f"{codec}_mediacodec", "device": enc.get("component"),
@@ -633,24 +708,16 @@ def dispatch(argv: list[str]) -> int:
                                   "output": ",".join(p.target for p in gpu_plans)})
                 return rc
 
-            file_outputs = [p.target for p in gpu_plans if not ffmpeg_args.is_pipe(p.target)]
             before = _snapshot(file_outputs)
             if file_outputs:
-                # Stage file outputs to per-attempt temps: a failed or orphaned
-                # encoder writes a temp path, never the user's final file, and a
-                # retry uses a fresh temp rather than racing a live writer.
-                staged = _stage_outputs(native_cmd, gpu_plans)
-                if staged is None:
-                    # The dispatcher cannot own a required destination (an
-                    # existing output without -y, or an unlocatable token), so
-                    # it must not run a recoverable probe over it. Exec the
-                    # original command: this process *is* the single writer, so
-                    # a cancellation kills it directly and nothing can race it.
-                    telemetry.record({"kind": "job", "op": "ffmpeg", "backend": "cpu",
-                                      "fallback_reason": "output ownership unavailable; running unaccelerated",
-                                      "output": ",".join(file_outputs)})
-                    _exec(cpu_cmd, _cpu_env())
-                run_cmd, staged_pairs = staged
+                # Stage every file output to per-attempt temps: a failed or
+                # orphaned encoder writes temp paths, never the user's finals,
+                # and a retry uses fresh temps rather than racing a live writer.
+                try:
+                    run_cmd, staged_pairs = _stage_cmd(native_cmd, file_outputs,
+                                                       has_y="-y" in native_cmd)
+                except _CannotStage as exc:
+                    return _unowned_staging(exc, cpu_cmd, file_outputs)
             else:
                 # Nothing on disk to protect (pipe outputs only).
                 run_cmd, staged_pairs = native_cmd, []
@@ -675,7 +742,8 @@ def dispatch(argv: list[str]) -> int:
             if _cancelled():
                 _discard_outputs(staged_pairs)
                 return _die_by_signal(_cancelled())
-            produced = [t for _f, t in staged_pairs] or file_outputs
+            produced = _staged_media(staged_pairs, media) if staged_pairs \
+                else _declared_media(file_outputs, media)
             problem = f"native ffmpeg exit {rc}" if rc != 0 else _validate(produced)
             publish_failed = False
             if problem is None and staged_pairs:
@@ -720,13 +788,14 @@ def dispatch(argv: list[str]) -> int:
         # Remove what the failed GPU attempt wrote so the CPU run starts clean.
         _remove_partial(file_outputs, before)
         # The fallback obeys exactly the same ownership contract as the hardware
-        # attempt: its own fresh temp, its own owned process group, and a publish
-        # only after it completes and validates.
+        # attempt, over the same complete set of file outputs: its own fresh
+        # temps, its own owned process group, and a publish only after it
+        # completes and validates.
         if file_outputs:
-            cpu_staged = _stage_outputs(cpu_cmd, gpu_plans)
-            if cpu_staged is None:
-                _exec(cpu_cmd, _cpu_env())
-            cpu_run, cpu_pairs = cpu_staged
+            try:
+                cpu_run, cpu_pairs = _stage_cmd(cpu_cmd, file_outputs, has_y="-y" in cpu_cmd)
+            except _CannotStage as exc:
+                return _unowned_staging(exc, cpu_cmd, file_outputs)
         else:
             cpu_run, cpu_pairs = cpu_cmd, []
         rc2, err2 = _run_owned(cpu_run, _cpu_env(), capture_stderr=True)
@@ -735,7 +804,8 @@ def dispatch(argv: list[str]) -> int:
             return _die_by_signal(_cancelled())
         cpu_problem = f"cpu ffmpeg exit {rc2}" if rc2 != 0 else None
         if cpu_problem is None:
-            cpu_problem = _validate([t for _f, t in cpu_pairs] or file_outputs)
+            cpu_problem = _validate(_staged_media(cpu_pairs, media) if cpu_pairs
+                                    else _declared_media(file_outputs, media))
         if cpu_problem is None and cpu_pairs:
             cpu_problem = _commit_outputs(cpu_pairs)
         if cpu_problem is not None:

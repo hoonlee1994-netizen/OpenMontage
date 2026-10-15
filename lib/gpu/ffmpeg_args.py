@@ -13,6 +13,7 @@ encoder) stays on the CPU command, unmodified.
 """
 from __future__ import annotations
 
+import os
 import re
 
 
@@ -72,6 +73,24 @@ _HEVC_PROFILES = {"main"}
 _LEGACY_CFR_CONTAINERS = {"mp4", "mov", "m4v", "3gp", "3g2", "ipod", "ismv", "psp"}
 
 HW_ENCODER_FOR = {"libx264": "h264", "h264": "h264", "libx265": "hevc", "hevc": "hevc"}
+
+# Muxers that fan one output option out into several files (a segment list, a
+# playlist plus its parts, or a tee fan-out). No single path owns them, so they
+# are never translated and never staged as one destination.
+_MULTIFILE_MUXERS = {
+    "segment", "ssegment", "stream_segment", "hls", "dash", "tee", "webm_chunk",
+}
+# Muxers whose target is not the file they write (a stream endpoint, a discard,
+# a frame buffer device): the dispatcher never stages or publishes them.
+_NONFILE_MUXERS = {
+    "null", "fifo", "rtsp", "rtmp", "rtmps", "udp", "tcp", "srt", "rist",
+    "icecast", "sap", "caca", "fbdev", "opengl", "sdl", "alsa", "oss",
+}
+# Single-file muxers that carry no media stream to probe (text / checksums).
+_TEXT_MUXERS = {"md5", "framemd5", "framecrc", "hash", "streamhash", "ffmetadata", "data"}
+
+# A target like ``rtmp://host/app`` is a network endpoint, not a local file.
+_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://")
 
 
 class Segment:
@@ -261,6 +280,10 @@ def plan_output(seg: Segment, idx: int, parsed=None, probe_fps=None) -> OutputPl
     container = (_container(seg) or "").lower()
     if container in {"null"}:
         return OutputPlan(idx, target, "none", "null muxer (analysis/decode only)")
+    if container in _MULTIFILE_MUXERS:
+        # One output option, several files: not translatable, and not ownable
+        # as a single destination (the dispatcher refuses mixed commands).
+        return OutputPlan(idx, target, "none", f"multi-file {container} muxer")
     if container in {e[1:] for e in _AUDIO_EXT} or container in {"wav", "mp3", "adts", "ogg", "flac", "opus"}:
         return OutputPlan(idx, target, "none", "audio-only container")
     if container in {e[1:] for e in _IMAGE_EXT} or container in {"image2", "image2pipe", "apng", "gif"} \
@@ -488,3 +511,83 @@ def renders_text(argv: list[str]) -> bool:
         if _FONT_FILE_RE.search(a):
             return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Output ownership
+#
+# The dispatcher stages every *file* output of a command it accelerates,
+# publishes them only after the attempt succeeded and its files validated, and
+# rolls the whole group back together on failure. That contract only holds if
+# the command's complete output surface is classified first: an output the
+# dispatcher cannot own must make it refuse the command, never run an unowned
+# writer (hardware *or* CPU fallback) against a production asset.
+# ---------------------------------------------------------------------------
+
+class OutputOwnership:
+    """How the dispatcher must treat one output destination.
+
+    ``kind`` is one of:
+      ``"file"``   a single filesystem file: stage, validate, publish, rollback;
+      ``"pipe"``   a pipe/fd stream: ordinary streaming semantics, never staged;
+      ``"other"``  a discard or a non-file target (network/device): never staged;
+      ``"unsafe"`` a *file-writing* destination that cannot be owned as one path
+                   (a numbered pattern or a multi-file muxer): the command must
+                   be refused rather than write it unprotected.
+
+    ``media`` is the validation strength the transaction applies to the file
+    (see ``ffmpeg_exec._validate``): ``"video"`` for an output produced by a
+    video encode, ``"file"`` for a text/checksum muxer, ``"media"`` otherwise.
+    """
+    __slots__ = ("index", "target", "kind", "media", "reason")
+
+    def __init__(self, index, target, kind, media="file", reason=""):
+        self.index = index
+        self.target = target
+        self.kind = kind
+        self.media = media
+        self.reason = reason
+
+    def __repr__(self):
+        return f"OutputOwnership({self.index}, {self.target!r}, {self.kind!r}, {self.reason!r})"
+
+
+def output_ownership(seg: Segment, idx: int, parsed=None) -> OutputOwnership:
+    """Classify the destination of one output ``seg`` for the transaction."""
+    target = seg.target
+    if not target:
+        return OutputOwnership(idx, target, "other", reason="output without a target")
+    if is_pipe(target):
+        return OutputOwnership(idx, target, "pipe", reason="pipe/fd stream")
+    muxer = (_last(seg.opts, ("-f",)) or "").lower()
+    if muxer in _NONFILE_MUXERS or _SCHEME_RE.match(target):
+        return OutputOwnership(idx, target, "other", reason="non-file target")
+    if "%" in target:
+        # A numbered image/segment pattern: the set of files it writes is only
+        # known at run time, so it cannot be staged or rolled back as one path.
+        return OutputOwnership(idx, target, "unsafe", reason="numbered/pattern output")
+    if muxer in _MULTIFILE_MUXERS:
+        return OutputOwnership(idx, target, "unsafe", reason=f"multi-file {muxer} muxer")
+    try:
+        if os.path.exists(target) and not (os.path.isfile(target) or os.path.isdir(target)):
+            # An existing device, FIFO or socket: not a file to own (and never
+            # something to publish a temp over).
+            return OutputOwnership(idx, target, "other", reason="existing non-regular target")
+    except OSError:
+        pass
+    plan = plan_output(seg, idx, parsed)
+    if muxer in _TEXT_MUXERS:
+        media = "file"
+    elif plan.action in ("gpu", "cpu"):
+        media = "video"
+    else:
+        media = "media"
+    return OutputOwnership(idx, target, "file", media, plan.reason)
+
+
+def own_outputs(argv: list[str]) -> list[OutputOwnership]:
+    """Classify every output of ``argv`` (the dispatcher's ownership surface)."""
+    parsed = parse(argv)
+    if not parsed.ok:
+        return []
+    return [output_ownership(seg, i, parsed) for i, seg in enumerate(parsed.outputs)]

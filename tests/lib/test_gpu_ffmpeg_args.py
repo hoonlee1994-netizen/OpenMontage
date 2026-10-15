@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import pytest
 
-from lib.gpu.ffmpeg_args import crf_to_cq, parse, reads_stdin, renders_text, translate, writes_stdout
+from lib.gpu.ffmpeg_args import (crf_to_cq, own_outputs, parse, reads_stdin,
+                                 renders_text, translate, writes_stdout)
 
 HW = {"h264", "hevc"}
 
@@ -63,6 +64,10 @@ def test_semantics_changing_requests_stay_on_cpu(argv, reason):
     ["-y", "-i", "in.mp4", "frames_%04d.png"],
     ["-y", "-i", "in.mp4", "-vn", "-c:a", "libmp3lame", "o.mp3"],
     ["-y", "-i", "in.mp4", "-ss", "3", "-frames:v", "1", "thumb.jpg"],
+    # A multi-file muxer writes several files from one output option: it is
+    # never translated (and a mixed command that contains one is refused).
+    ["-y", "-i", "in.mp4", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-f", "hls", "out.m3u8"],
+    ["-y", "-i", "in.mp4", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-f", "segment", "out_%03d.ts"],
     ["-hide_banner", "-version"],
 ])
 def test_commands_without_video_encode_are_left_alone(argv):
@@ -271,3 +276,56 @@ def test_text_rendering_commands_are_detected(argv):
 ])
 def test_non_text_commands_are_not_flagged(argv):
     assert not renders_text(argv)
+
+
+# --- output ownership classification (the dispatcher's staging surface) -----
+
+def test_own_outputs_marks_a_single_video_file_as_owned_video():
+    o = own_outputs(["-y", "-i", "in.mp4", "-c:v", "libx264", "-pix_fmt", "yuv420p", "out.mp4"])[0]
+    assert (o.kind, o.media, o.target) == ("file", "video", "out.mp4")
+
+
+def test_own_outputs_marks_stream_copy_and_audio_outputs_as_media_files():
+    outs = own_outputs(["-y", "-i", "in.mp4",
+                        "-t", "1", "-c", "copy", "copy.mp4",
+                        "-t", "1", "-vn", "-c:a", "aac", "audio.m4a"])
+    assert [(o.kind, o.media) for o in outs] == [("file", "media"), ("file", "media")]
+
+
+def test_own_outputs_keeps_a_single_image_file_but_flags_a_pattern():
+    single = own_outputs(["-y", "-i", "in.mp4", "-frames:v", "1", "thumb.jpg"])[0]
+    assert (single.kind, single.media) == ("file", "media")
+    pattern = own_outputs(["-y", "-i", "in.mp4", "frame_%04d.png"])[0]
+    assert pattern.kind == "unsafe"
+
+
+@pytest.mark.parametrize("muxer,target", [
+    ("hls", "out.m3u8"), ("segment", "out_%03d.ts"), ("dash", "out.mpd"), ("tee", "a.mp4"),
+])
+def test_own_outputs_flags_multi_file_muxers_as_unsafe(muxer, target):
+    assert own_outputs(["-y", "-i", "in.mp4", "-f", muxer, target])[0].kind == "unsafe"
+
+
+def test_own_outputs_leaves_pipes_discards_and_network_targets_alone():
+    assert own_outputs(["-i", "in.mp4", "-f", "null", "-"])[0].kind == "pipe"
+    assert own_outputs(["-i", "in.mp4", "pipe:1"])[0].kind == "pipe"
+    assert own_outputs(["-y", "-i", "in.mp4", "-f", "null", "/dev/null"])[0].kind == "other"
+    assert own_outputs(["-y", "-i", "in.mp4", "-f", "mp4", "rtmp://host/app"])[0].kind == "other"
+
+
+def test_own_outputs_skips_a_non_regular_device_target():
+    # /dev/null exists and is neither a file nor a directory: never staged over.
+    assert own_outputs(["-y", "-i", "in.mp4", "-f", "mp4", "/dev/null"])[0].kind == "other"
+
+
+def test_own_outputs_treats_a_checksum_muxer_as_a_plain_file():
+    o = own_outputs(["-y", "-i", "in.mp4", "-f", "md5", "sums.md5"])[0]
+    assert (o.kind, o.media) == ("file", "file")
+
+
+def test_own_outputs_keeps_a_directory_target_ownable_so_publish_refuses_it(tmp_path):
+    # A directory named as an output stays ownable: the transaction's pre-flight
+    # refuses it, which is reported instead of letting ffmpeg error out.
+    d = tmp_path / "blocked.mp4"
+    d.mkdir()
+    assert own_outputs(["-y", "-i", "in.mp4", str(d)])[0].kind == "file"

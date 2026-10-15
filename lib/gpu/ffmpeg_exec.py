@@ -17,6 +17,18 @@ are exec'd on the Debian FFmpeg directly, with no overhead beyond the shim.
 Commands that read stdin or write stdout cannot be replayed after a partial
 run, so they take the GPU path only while the encoder backend is healthy and
 are exec'd without fallback.
+
+Output ownership: every attempt — the hardware encode *and* the CPU fallback —
+writes per-attempt temp files beside the final output and publishes them with
+one atomic, rollback-capable transaction, only after the attempt succeeded and
+its files validated. A failed, cancelled or orphaned encoder can therefore only
+ever write a discarded temp, never a production file, and two attempts never
+own the same destination at the same time. Each owned subprocess leads its own
+session and carries ``PR_SET_PDEATHSIG``, so it is stopped together with its
+process group and cannot outlive the dispatcher. When ownership cannot be
+guaranteed (an existing output without ``-y``, or an output token that cannot
+be located), the original command is exec'd directly rather than run behind a
+recoverable probe that could orphan a writer.
 """
 from __future__ import annotations
 
@@ -58,6 +70,13 @@ BACKEND = "mediacodec-encoder"
 # Whether the last native run went through the PRoot-free worker (telemetry).
 OOP_LAST = False
 
+# Cancellation bookkeeping for the subprocesses this dispatcher owns.
+# ``proc`` is the active attempt's process-group leader (None between runs);
+# ``signum`` is a termination signal observed while an attempt was in flight,
+# which forces that attempt to be abandoned instead of published; ``saved``
+# holds the pre-existing handlers while our own are installed.
+_OWNED = {"proc": None, "signum": 0, "saved": None}
+
 
 def real_ffmpeg() -> str:
     """The Debian (CPU) ffmpeg, skipping our own shim directory on PATH."""
@@ -97,6 +116,17 @@ def _exec(cmd: list[str], env: dict[str, str]) -> None:
     sys.stdout.flush()
     sys.stderr.flush()
     os.execve(cmd[0], cmd, env)
+
+
+def _write_err(data: bytes) -> None:
+    """Best-effort passthrough of an encoder's captured stderr."""
+    if not data:
+        return
+    try:
+        sys.stderr.buffer.write(data)
+        sys.stderr.flush()
+    except (AttributeError, ValueError, OSError):
+        pass
 
 
 def _validate(outputs: list) -> "str | None":
@@ -157,6 +187,51 @@ def _temp_path(final: str) -> str:
     return os.path.join(d, token + ext) if d else token + ext
 
 
+class _CannotStage(Exception):
+    """The dispatcher cannot take ownership of a required file output."""
+
+
+def _locate_output(cmd: list, final: str) -> "int | None":
+    """Index of ``final`` as an output token in ``cmd`` (outputs trail inputs).
+
+    Exact token match first, then a normalised-path match so a ``./out.mp4``
+    spelling still resolves; the search runs right-to-left because outputs come
+    after the inputs that may share the same path.
+    """
+    for i in range(len(cmd) - 1, -1, -1):
+        if cmd[i] == final:
+            return i
+    norm = os.path.normpath(final)
+    for i in range(len(cmd) - 1, -1, -1):
+        if os.path.normpath(cmd[i]) == norm:
+            return i
+    return None
+
+
+def _stage_cmd(cmd: list, targets: list, *, has_y: bool) -> "tuple[list, list]":
+    """Redirect every non-pipe ``targets`` entry to a fresh sibling temp.
+
+    Returns ``(staged_cmd, [(final, temp), ...])`` or raises ``_CannotStage``
+    when ownership cannot be guaranteed: an existing output without ``-y``
+    (refuse/prompt semantics must be preserved) or a target that does not
+    appear as an output token.
+    """
+    staged = list(cmd)
+    pairs = []
+    for final in targets:
+        if ffmpeg_args.is_pipe(final):
+            continue
+        if not has_y and os.path.exists(final):
+            raise _CannotStage(f"{final} exists and the command has no -y")
+        idx = _locate_output(staged, final)
+        if idx is None:
+            raise _CannotStage(f"output token not found in command: {final}")
+        temp = _temp_path(final)
+        staged[idx] = temp
+        pairs.append((final, temp))
+    return staged, pairs
+
+
 def _stage_outputs(cmd: list, gpu_plans: list) -> "tuple[list, list] | None":
     """Redirect GPU file outputs to per-attempt temp files in the same directory.
 
@@ -170,37 +245,84 @@ def _stage_outputs(cmd: list, gpu_plans: list) -> "tuple[list, list] | None":
     must not be staged — an existing output without ``-y`` (refuse/prompt
     semantics must be preserved) or an output token that cannot be located.
     """
-    has_y = "-y" in cmd
-    staged = list(cmd)
-    pairs = []
-    for p in gpu_plans:
-        if ffmpeg_args.is_pipe(p.target):
-            continue
-        final = p.target
-        if not has_y and os.path.exists(final):
-            return None  # ffmpeg would refuse to overwrite; do not fake success
-        idx = None
-        for i in range(len(staged) - 1, -1, -1):  # outputs trail their options
-            if staged[i] == final:
-                idx = i
-                break
-        if idx is None:
-            return None
-        temp = _temp_path(final)
-        staged[idx] = temp
-        pairs.append((final, temp))
+    targets = [p.target for p in gpu_plans]
+    try:
+        staged, pairs = _stage_cmd(cmd, targets, has_y="-y" in cmd)
+    except _CannotStage:
+        return None
     if not pairs:
         return None
     return staged, pairs
 
 
 def _commit_outputs(pairs: list) -> "str | None":
-    """Atomically publish validated temps over their final paths."""
-    for final, temp in pairs:
-        try:
+    """Publish validated temps over their finals as one all-or-nothing step.
+
+    Every destination is checked *before* anything is touched, and each
+    existing final is first backed by a hard link (same inode), so its bytes
+    survive even if this process is killed mid-publish. If any publish then
+    fails — or the job was cancelled — every final is restored and the error is
+    returned; a partial publication is never reported as success.
+    """
+    for final, _temp in pairs:
+        if os.path.isdir(final):
+            return f"could not publish {final}: target is a directory"
+        parent = os.path.dirname(final) or "."
+        if not os.path.isdir(parent):
+            return f"could not publish {final}: no such directory: {parent}"
+        if not os.access(parent, os.W_OK):
+            return f"could not publish {final}: directory not writable: {parent}"
+
+    backups = []    # (final, backup_path, mode) for every pre-existing final
+    published = []  # indices whose temp already reached its final
+    current = pairs[0][0] if pairs else ""
+    try:
+        for final, _temp in pairs:
+            if os.path.exists(final):
+                bak = _temp_path(final) + ".bak"
+                mode = os.stat(final).st_mode & 0o7777
+                try:
+                    os.link(final, bak)  # old bytes stay reachable at final too
+                except OSError:
+                    os.replace(final, bak)  # filesystem without hard links
+                backups.append((final, bak, mode))
+        for index, (final, temp) in enumerate(pairs):
+            current = final
+            if _cancelled():
+                raise OSError("cancelled during publish")
             os.replace(temp, final)
-        except OSError as exc:
-            return f"could not publish {final}: {exc}"
+            published.append(index)
+            for b_final, _bak, mode in backups:
+                if b_final == final:
+                    try:
+                        os.chmod(final, mode)  # replacing kept -rw-r--r--/exec bits
+                    except OSError:
+                        pass
+                    break
+    except OSError as exc:
+        published_final = {pairs[index][0] for index in published}
+        for final, bak, _mode in backups:
+            if final not in published_final and os.path.exists(final):
+                # Never replaced, so its original bytes are still in place and
+                # the backup link is redundant: drop it instead of restoring.
+                try:
+                    os.unlink(bak)
+                except OSError:
+                    pass
+                continue
+            try:
+                os.replace(bak, final)  # put the old bytes back
+            except OSError:
+                try:
+                    os.unlink(bak)
+                except OSError:
+                    pass
+        return f"could not publish {current}: {exc}"
+    for _final, bak, _mode in backups:
+        try:
+            os.unlink(bak)
+        except OSError:
+            pass
     return None
 
 
@@ -277,15 +399,108 @@ def _set_pdeathsig() -> None:
         pass
 
 
-def _run_native_remote(cmd: list[str], *, capture_stderr: bool) -> "tuple[int, bytes] | None":
-    """Run the native command in the PRoot-free worker, or None to fall back.
+def _forward_to(proc, signum: int) -> None:
+    """Signal a child's whole process group, not just the child itself."""
+    try:
+        os.killpg(proc.pid, signum)
+        return
+    except OSError:
+        pass
+    try:
+        proc.send_signal(signum)
+    except (ProcessLookupError, OSError):
+        pass
+
+
+def _cancelled() -> int:
+    """Signal number that arrived while an attempt was in flight, else 0."""
+    return _OWNED["signum"]
+
+
+def _owned_signal(signum, _frame) -> None:
+    """Record a cancellation and stop the active encoder group immediately.
+
+    The dispatcher itself is not terminated here: the caller abandons the
+    attempt (discarding staged temps instead of publishing them) and then exits
+    with this signal, so a cancelled job can never publish an output.
+    """
+    _OWNED["signum"] = signum
+    proc = _OWNED["proc"]
+    if proc is not None:
+        # First cancellation stops the encoder gracefully; a repeat (e.g. a
+        # caller that retries its timeout) escalates so nothing survives.
+        if proc.returncode is None and _OWNED.get("stopped") == proc.pid:
+            _forward_to(proc, signal.SIGKILL)
+        else:
+            _forward_to(proc, signal.SIGTERM)
+            _OWNED["stopped"] = proc.pid
+
+
+def _install_cancel_handlers() -> None:
+    _load()
+    _OWNED["signum"] = 0
+    _OWNED["stopped"] = None
+    _OWNED["saved"] = {s: signal.signal(s, _owned_signal)
+                       for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+
+
+def _restore_cancel_handlers() -> None:
+    saved = _OWNED.get("saved")
+    if not saved:
+        return
+    for s, handler in saved.items():
+        signal.signal(s, handler)
+    _OWNED["saved"] = None
+
+
+def _die_by_signal(signum: int) -> int:
+    """Exit exactly as if ``signum`` had terminated the dispatcher."""
+    _restore_cancel_handlers()
+    try:
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+    except (OSError, ValueError):
+        pass
+    return 128 + signum
+
+
+def _run_owned(cmd: list[str], env: dict, *, capture_stderr: bool) -> tuple[int, bytes]:
+    """Run ``cmd`` as a process group owned by this dispatcher.
+
+    The child leads its own session (so the encoder and anything it spawns can
+    be stopped together) and carries ``PR_SET_PDEATHSIG`` (so it dies with the
+    dispatcher even on SIGKILL or a tool-level timeout). A cancellation signal
+    reaching the dispatcher is forwarded to the group by the installed handler;
+    the caller sees it through :func:`_cancelled` and must abandon the attempt
+    rather than publish it.
+    """
+    proc = subprocess.Popen(
+        cmd, env=env, stdin=None, stdout=None,
+        stderr=subprocess.PIPE if capture_stderr else None,
+        preexec_fn=_set_pdeathsig,
+        start_new_session=True,
+    )
+    _OWNED["proc"] = proc
+    try:
+        _, err = proc.communicate()
+    finally:
+        _OWNED["proc"] = None
+    return proc.returncode, err or b""
+
+
+def _run_native_remote(cmd: list[str], *, capture_stderr: bool) -> "tuple[bool, tuple[int, bytes] | None]":
+    """Run the native command in the PRoot-free worker, or fall back to PRoot.
 
     PRoot traces every native FFmpeg launch, and its path translation of the
     bionic runtime's dynamic linking is pure overhead (measured ~1.0 s per
     launch; see gpu_native/bench/oop_bench.py). The worker is an app-spawned
     process on the other side of PRoot (``lib.gpu.oop``), so the encode runs
-    untraced. Any failure — worker down, bad path map, timeout — returns None
-    and the caller runs the command under PRoot exactly as before.
+    untraced.
+
+    Returns ``(attempted, result)``. ``attempted`` is False when the worker was
+    simply unavailable (nothing ran, the caller may reuse its target); it is
+    True when a run may have started and then errored, in which case the caller
+    must not hand the same output path to its fallback.
     """
     global OOP_LAST
     from lib.gpu import oop
@@ -293,8 +508,10 @@ def _run_native_remote(cmd: list[str], *, capture_stderr: bool) -> "tuple[int, b
     r = oop.run(cmd, cwd=os.getcwd(), env=runtime.native_env(),
                 timeout=float(os.environ.get("OM_GPU_OOP_TIMEOUT_S", "3600")),
                 wait_s=float(os.environ.get("OM_GPU_OOP_WAIT_S", "2.5")))
-    if r is None or r.error:
-        return None
+    if r is None:
+        return False, None
+    if r.error:
+        return True, None
     OOP_LAST = True
     if r.stdout:
         try:
@@ -302,33 +519,21 @@ def _run_native_remote(cmd: list[str], *, capture_stderr: bool) -> "tuple[int, b
             sys.stdout.buffer.flush()
         except (AttributeError, ValueError, OSError):
             pass
-    return r.rc, r.stderr or b""
+    return True, (r.rc, r.stderr or b"")
 
 
-def _run_native(cmd: list[str], *, capture_stderr: bool, allow_remote: bool = True) -> tuple[int, bytes]:
+def _run_native(cmd: list[str], *, capture_stderr: bool, allow_remote: bool = True,
+                restage=None) -> tuple[int, bytes]:
     if allow_remote:
-        remote = _run_native_remote(cmd, capture_stderr=capture_stderr)
+        attempted, remote = _run_native_remote(cmd, capture_stderr=capture_stderr)
         if remote is not None:
             return remote
-    proc = subprocess.Popen(
-        cmd, env=runtime.native_env(), stdin=None, stdout=None,
-        stderr=subprocess.PIPE if capture_stderr else None,
-        preexec_fn=_set_pdeathsig,
-    )
-
-    def forward(signum, _frame):
-        try:
-            proc.send_signal(signum)
-        except ProcessLookupError:
-            pass
-
-    old = {s: signal.signal(s, forward) for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
-    try:
-        _, err = proc.communicate()
-    finally:
-        for s, h in old.items():
-            signal.signal(s, h)
-    return proc.returncode, err or b""
+        if attempted and restage is not None:
+            # A remote run may have started and then lost its connection; the
+            # traced fallback must write a *different* temp so two writers can
+            # never share one output path.
+            cmd = restage()
+    return _run_owned(cmd, runtime.native_env(), capture_stderr=capture_stderr)
 
 
 def dispatch(argv: list[str]) -> int:
@@ -400,75 +605,159 @@ def dispatch(argv: list[str]) -> int:
         _exec(cpu_cmd, _cpu_env())
 
     slots = int(os.environ.get("OM_GPU_ENCODER_SLOTS") or min(4, int(enc.get("max_instances") or 4)))
-    with runtime.codec_slot("hwenc", slots, wait_s=float(os.environ.get("OM_GPU_SLOT_WAIT_S", "900"))) as slot:
-        if slot is None:
-            if mode == "require":
-                sys.stderr.write("[openmontage-gpu] no hardware encoder slot available\n")
-                return 75
-            telemetry.record({"kind": "job", "op": "ffmpeg", "backend": "cpu",
-                              "fallback_reason": "all hardware encoder slots busy",
-                              "output": ",".join(p.target for p in gpu_plans)})
-            _exec(cpu_cmd, _cpu_env())
+    # From here on the dispatcher owns subprocesses and is the only thing that
+    # may publish outputs, so it must see a cancellation before it commits:
+    # the handlers below stop the active encoder group and mark the attempt
+    # abandoned rather than letting it publish.
+    _install_cancel_handlers()
+    try:
+        with runtime.codec_slot("hwenc", slots, wait_s=float(os.environ.get("OM_GPU_SLOT_WAIT_S", "900"))) as slot:
+            if slot is None:
+                if mode == "require":
+                    sys.stderr.write("[openmontage-gpu] no hardware encoder slot available\n")
+                    return 75
+                telemetry.record({"kind": "job", "op": "ffmpeg", "backend": "cpu",
+                                  "fallback_reason": "all hardware encoder slots busy",
+                                  "output": ",".join(p.target for p in gpu_plans)})
+                _exec(cpu_cmd, _cpu_env())
 
-        if streaming:
-            # Cannot replay a consumed pipe: run on hardware, no fallback.
-            rc, _ = _run_native(native_cmd, capture_stderr=False, allow_remote=False)
-            runtime.record_outcome(BACKEND, rc == 0, f"exit {rc}")
-            telemetry.record({"kind": "job", "op": "ffmpeg", "backend": "gpu" if rc == 0 else "gpu-failed",
+            if streaming:
+                # Cannot replay a consumed pipe: run on hardware, no fallback.
+                rc, _ = _run_native(native_cmd, capture_stderr=False, allow_remote=False)
+                if _cancelled():
+                    return _die_by_signal(_cancelled())
+                runtime.record_outcome(BACKEND, rc == 0, f"exit {rc}")
+                telemetry.record({"kind": "job", "op": "ffmpeg", "backend": "gpu" if rc == 0 else "gpu-failed",
+                                  "encoder": f"{codec}_mediacodec", "device": enc.get("component"),
+                                  "streaming": True, "rc": rc, "wall_s": round(time.time() - t0, 3),
+                                  "output": ",".join(p.target for p in gpu_plans)})
+                return rc
+
+            file_outputs = [p.target for p in gpu_plans if not ffmpeg_args.is_pipe(p.target)]
+            before = _snapshot(file_outputs)
+            if file_outputs:
+                # Stage file outputs to per-attempt temps: a failed or orphaned
+                # encoder writes a temp path, never the user's final file, and a
+                # retry uses a fresh temp rather than racing a live writer.
+                staged = _stage_outputs(native_cmd, gpu_plans)
+                if staged is None:
+                    # The dispatcher cannot own a required destination (an
+                    # existing output without -y, or an unlocatable token), so
+                    # it must not run a recoverable probe over it. Exec the
+                    # original command: this process *is* the single writer, so
+                    # a cancellation kills it directly and nothing can race it.
+                    telemetry.record({"kind": "job", "op": "ffmpeg", "backend": "cpu",
+                                      "fallback_reason": "output ownership unavailable; running unaccelerated",
+                                      "output": ",".join(file_outputs)})
+                    _exec(cpu_cmd, _cpu_env())
+                run_cmd, staged_pairs = staged
+            else:
+                # Nothing on disk to protect (pipe outputs only).
+                run_cmd, staged_pairs = native_cmd, []
+
+            def _fresh_stage():
+                """Re-point the traced fallback at brand-new temps."""
+                for i, (final, temp) in enumerate(staged_pairs):
+                    new_temp = _temp_path(final)
+                    idx = _locate_output(run_cmd, temp)
+                    if idx is not None:
+                        run_cmd[idx] = new_temp
+                    try:
+                        os.unlink(temp)
+                    except OSError:
+                        pass
+                    staged_pairs[i] = (final, new_temp)
+                return run_cmd
+
+            rc, err = _run_native(run_cmd, capture_stderr=True,
+                                  allow_remote=solo and not text_render,
+                                  restage=_fresh_stage if staged_pairs else None)
+            if _cancelled():
+                _discard_outputs(staged_pairs)
+                return _die_by_signal(_cancelled())
+            produced = [t for _f, t in staged_pairs] or file_outputs
+            problem = f"native ffmpeg exit {rc}" if rc != 0 else _validate(produced)
+            publish_failed = False
+            if problem is None and staged_pairs:
+                problem = _commit_outputs(staged_pairs)
+                publish_failed = problem is not None
+            if problem is not None:
+                _discard_outputs(staged_pairs)
+
+        if problem is None:
+            runtime.record_outcome(BACKEND, True)
+            _write_err(err)
+            telemetry.record({"kind": "job", "op": "ffmpeg", "backend": "gpu",
                               "encoder": f"{codec}_mediacodec", "device": enc.get("component"),
-                              "streaming": True, "rc": rc, "wall_s": round(time.time() - t0, 3),
+                              "oop": OOP_LAST, "text_render": text_render,
+                              "rc": 0, "wall_s": round(time.time() - t0, 3),
                               "output": ",".join(p.target for p in gpu_plans)})
-            return rc
+            return 0
 
-        file_outputs = [p.target for p in gpu_plans if not ffmpeg_args.is_pipe(p.target)]
-        before = _snapshot(file_outputs)
-        # Stage file outputs to per-attempt temps: a failed or orphaned
-        # hardware encoder writes a temp path, never the user's final file, and
-        # a retry uses a fresh temp rather than racing a live writer.
-        staged = _stage_outputs(native_cmd, gpu_plans)
-        run_cmd, staged_pairs = staged if staged else (native_cmd, [])
-        rc, err = _run_native(run_cmd, capture_stderr=True,
-                              allow_remote=solo and not text_render)
-        produced = [t for _f, t in staged_pairs] or file_outputs
-        problem = f"native ffmpeg exit {rc}" if rc != 0 else _validate(produced)
-        if problem is None and staged_pairs:
-            problem = _commit_outputs(staged_pairs)
-        if problem is not None:
-            _discard_outputs(staged_pairs)
+        tail = err.decode("utf-8", "replace").strip().splitlines()[-4:]
+        detail = f"{problem}: {' | '.join(tail)}"
+        if mode == "require":
+            runtime.record_outcome(BACKEND, False, detail)
+            _write_err(err)
+            sys.stderr.write(f"[openmontage-gpu] hardware path failed and OM_GPU_MODE=require: {problem}\n")
+            telemetry.record({"kind": "job", "op": "ffmpeg", "backend": "gpu-failed", "fallback_reason": detail,
+                              "wall_s": round(time.time() - t0, 3),
+                              "output": ",".join(p.target for p in gpu_plans)})
+            return rc or 1
 
-    if problem is None:
-        runtime.record_outcome(BACKEND, True)
-        sys.stderr.buffer.write(err)
-        sys.stderr.flush()
-        telemetry.record({"kind": "job", "op": "ffmpeg", "backend": "gpu",
-                          "encoder": f"{codec}_mediacodec", "device": enc.get("component"),
-                          "oop": OOP_LAST, "text_render": text_render,
-                          "rc": 0, "wall_s": round(time.time() - t0, 3),
-                          "output": ",".join(p.target for p in gpu_plans)})
-        return 0
+        if publish_failed:
+            # The encoders produced valid output; the destination refused it and
+            # the transaction restored every pre-existing file. A CPU re-run
+            # cannot help and must not touch the destination again.
+            runtime.record_outcome(BACKEND, False, detail)
+            sys.stderr.write(f"[openmontage-gpu] could not publish output; existing files left untouched: "
+                             f"{problem}\n")
+            telemetry.record({"kind": "job", "op": "ffmpeg", "backend": "gpu-failed", "fallback_reason": detail,
+                              "wall_s": round(time.time() - t0, 3),
+                              "output": ",".join(p.target for p in gpu_plans)})
+            return rc or 1
 
-    tail = err.decode("utf-8", "replace").strip().splitlines()[-4:]
-    detail = f"{problem}: {' | '.join(tail)}"
-    if mode == "require":
+        # Remove what the failed GPU attempt wrote so the CPU run starts clean.
+        _remove_partial(file_outputs, before)
+        # The fallback obeys exactly the same ownership contract as the hardware
+        # attempt: its own fresh temp, its own owned process group, and a publish
+        # only after it completes and validates.
+        if file_outputs:
+            cpu_staged = _stage_outputs(cpu_cmd, gpu_plans)
+            if cpu_staged is None:
+                _exec(cpu_cmd, _cpu_env())
+            cpu_run, cpu_pairs = cpu_staged
+        else:
+            cpu_run, cpu_pairs = cpu_cmd, []
+        rc2, err2 = _run_owned(cpu_run, _cpu_env(), capture_stderr=True)
+        if _cancelled():
+            _discard_outputs(cpu_pairs)
+            return _die_by_signal(_cancelled())
+        cpu_problem = f"cpu ffmpeg exit {rc2}" if rc2 != 0 else None
+        if cpu_problem is None:
+            cpu_problem = _validate([t for _f, t in cpu_pairs] or file_outputs)
+        if cpu_problem is None and cpu_pairs:
+            cpu_problem = _commit_outputs(cpu_pairs)
+        if cpu_problem is not None:
+            _discard_outputs(cpu_pairs)
+            _write_err(err2)
+            sys.stderr.write(f"[openmontage-gpu] cpu fallback produced no usable output: {cpu_problem}\n")
+            telemetry.record({"kind": "job", "op": "ffmpeg", "backend": "cpu-failed",
+                              "fallback_reason": f"{detail}; {cpu_problem}", "rc": rc2,
+                              "wall_s": round(time.time() - t0, 3),
+                              "output": ",".join(p.target for p in gpu_plans)})
+            return rc2 or 1
+        # Only a failure the CPU path does not share is a hardware-path failure;
+        # a bad command (e.g. refusing to overwrite) must not trip the breaker.
         runtime.record_outcome(BACKEND, False, detail)
-        sys.stderr.buffer.write(err)
-        sys.stderr.write(f"[openmontage-gpu] hardware path failed and OM_GPU_MODE=require: {problem}\n")
-        telemetry.record({"kind": "job", "op": "ffmpeg", "backend": "gpu-failed", "fallback_reason": detail,
+        _write_err(err2)
+        telemetry.record({"kind": "job", "op": "ffmpeg", "backend": "cpu",
+                          "fallback_reason": detail, "rc": 0,
                           "wall_s": round(time.time() - t0, 3),
                           "output": ",".join(p.target for p in gpu_plans)})
-        return rc or 1
-    # Remove what the failed GPU attempt wrote so the CPU run starts clean.
-    _remove_partial(file_outputs, before)
-    proc = subprocess.run(cpu_cmd, env=_cpu_env())
-    # Only a failure the CPU path does not share is a hardware-path failure;
-    # a bad command (e.g. refusing to overwrite) must not trip the breaker.
-    if proc.returncode == 0:
-        runtime.record_outcome(BACKEND, False, detail)
-    telemetry.record({"kind": "job", "op": "ffmpeg", "backend": "cpu" if proc.returncode == 0 else "cpu-failed",
-                      "fallback_reason": detail, "rc": proc.returncode,
-                      "wall_s": round(time.time() - t0, 3),
-                      "output": ",".join(p.target for p in gpu_plans)})
-    return proc.returncode
+        return 0
+    finally:
+        _restore_cancel_handlers()
 
 
 def main(argv: "list[str] | None" = None) -> int:

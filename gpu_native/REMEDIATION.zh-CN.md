@@ -1,11 +1,13 @@
 # 独立 L5 验收三项阻断项的修复报告（M1 / M2 / M3）
 
-日期：2026-10-14
+日期：2026-10-14（第 1–2 轮）／2026-10-15（第 3 轮）
 设备：Android / ARM64 / MediaTek MT6899（Mali-G720 MC8）/ Termux + PRoot Debian 12
 分支：`feat/gpu-native-openmontage`（仅本地提交，未推送、未合并）
-修复提交：`a6bbb27`　被阻断版本：`585eed3`
+修复提交：`a6bbb27`（第 1 轮）　`205a370`（第 2 轮）　`3268e8e`（第 3 轮）　被阻断版本：`585eed3`
 
 > 结论先行：独立 GPT-6.1 L5 验收给出的三个阻断项——**M1 未显式指定像素格式时的静默位深/色度降级**、**M2 硬件编码器孤儿与输出所有权（部分产物当成功发布的风险）**、**M3 免 PRoot 路径字体命名空间不等价导致字幕变方框且仍 `rc=0`**——已全部定位根因、修复并给出**前/后实测证据**。GPU 优先默认（`OM_GPU_MODE=auto`）、Mali/MediaTek 硬件路径与 CPU 回退均保持不变；未改动产品契约，未弱化既有测试。
+>
+> 第 3 轮（本页第 11 节）：最终 L5 复验判定 M2 仍阻断——第 2 轮的事务只覆盖 `gpu_plans`（被翻译成硬件编码的视频输出），同一命令里的 **stream copy / 音频 / 图片等其他文件输出仍直写生产路径**，实测把一份 20,897,137 字节成片截断为 0 字节。第 3 轮把「整条 FFmpeg 命令的输出契约」作为所有权单位，**无法安全接管时在改写任何文件之前明确失败**。
 >
 > **本报告不主张独立 L5 通过。** 复现与判定应由独立方按其自身用例重跑。
 
@@ -89,7 +91,7 @@ AV-2997 mode=auto rc=0 -> High / yuv420p range=tv
 
 ## 2. 发现二：硬件编码器孤儿与输出所有权
 
-> **注意：** 本节记录**第一轮**修复（`a6bbb27`），只闭合了「硬件编码直接孤儿」。独立复审确认 **M2 仍阻断**（CPU 回退直接写生产路径、取消后回退子进程存活、多输出失败破坏既有资产）。第二轮补修见 **第 10 节**（提交 `205a370`），本节结论以第 10 节为准。
+> **注意：** 本节记录**第一轮**修复（`a6bbb27`），只闭合了「硬件编码直接孤儿」。独立复审确认 **M2 仍阻断**（CPU 回退直接写生产路径、取消后回退子进程存活、多输出失败破坏既有资产）。第二轮补修见 **第 10 节**（提交 `205a370`）；最终复验指出第二轮事务仍只覆盖 `gpu_plans`，第三轮把所有权扩到**整条命令的全部文件输出**，见 **第 11 节**（提交 `3268e8e`）。本节结论以第 11 节为准。
 
 ### 2.1 根因（三处，缺一不可）
 
@@ -273,6 +275,8 @@ OM_M2_WORKER=/tmp/om/om_gpu_worker_old.py .venv/bin/python /tmp/om/m2_verify.py 
   - 变更文件：`lib/gpu/ffmpeg_args.py`、`lib/gpu/ffmpeg_exec.py`、`lib/gpu/oop.py`、`gpu_native/worker/om_gpu_worker.py`、`tests/lib/test_gpu_ffmpeg_args.py`、`tests/lib/test_gpu_dispatch_safety.py`
 - 第二轮（M2 复审补修）提交：`205a370 fix(gpu): stage the CPU fallback and own its lifecycle`（见第 10 节）
   - 变更文件：`lib/gpu/ffmpeg_exec.py`、`tests/lib/test_gpu_dispatch_safety.py`
+- 第三轮（M2 全命令输出所有权）提交：`3268e8e fix(gpu): own every file output of an accelerated ffmpeg command`（见第 11 节）
+  - 变更文件：`lib/gpu/ffmpeg_args.py`、`lib/gpu/ffmpeg_exec.py`、`tests/lib/test_gpu_dispatch_safety.py`、`tests/lib/test_gpu_ffmpeg_args.py`
 - **未推送、未合并。**
 
 ---
@@ -386,4 +390,150 @@ cp /tmp/om/m2r/ffmpeg_exec.fixed.py lib/gpu/ffmpeg_exec.py
 
 - 补修提交：`205a370 fix(gpu): stage the CPU fallback and own its lifecycle`
 - 变更文件：`lib/gpu/ffmpeg_exec.py`、`tests/lib/test_gpu_dispatch_safety.py`
+- **未推送、未合并。**
+
+---
+
+## 11. M2 复审补修（第三轮）：整条 FFmpeg 命令的输出所有权
+
+最终 L5 复验（`/tmp/om-l5-m2-final/REPORT.zh-CN.md`）判定 M2 仍阻断：第 2 轮的事务只覆盖 `gpu_plans`，同一命令中的**其他文件输出**仍可绕过保护。本节记录第三轮的根因、更正后的所有权模型、以**真实子进程与真实 FFmpeg** 做的独立前/后复现、SHA-256 与进程生命周期证据、回归与 GPU 优先验证、以及剩余限制。
+
+### 11.1 根因与更正后的所有权模型
+
+**根因（第 2 轮代码 `eae7e49`）**——`lib/gpu/ffmpeg_exec.py:668` 与 `:726` 附近：
+
+```python
+file_outputs = [p.target for p in gpu_plans if not ffmpeg_args.is_pipe(p.target)]
+staged = _stage_outputs(native_cmd, gpu_plans)   # 硬件尝试
+cpu_staged = _stage_outputs(cpu_cmd, gpu_plans)  # CPU 回退
+```
+
+- 被暂存的目标只来自 `gpu_plans`（被翻译成 `h264_mediacodec/hevc_mediacodec` 的视频输出）。
+- 同一命令里的 **stream copy（`-c copy`）、音频、图片** 等输出属于 `OutputPlan.action == "none"`，其 target 仍**逐字保留**在命令里 → 没有暂存、没有校验、没有回滚。
+- `_stage_outputs` 在无法接管时**吞掉原因**并返回 `None`，调用方一律 `_exec(cpu_cmd)`：对「目标 token 找不到」这种**无法识别**的情形也退化成未保护的直写。
+- `_validate` 硬性要求 `v:0` 视频流，无法校验音频/stream copy/图片输出。
+- 实测破坏：GPU 视频输出指向不存在的目录时，硬件尝试与 CPU 回退**先直接截断**同一命令里已存在的 `existing.mp4`（20,897,137 字节 → 0 字节）与 `audio.m4a`（18,784 字节 → 0 字节），再在第二个输出上失败。
+
+**更正后的所有权模型**——把「**整条命令的输出契约**」作为所有权单位，新增 `lib.gpu.ffmpeg_args.own_outputs()` 先对命令的**全部输出**分类（`OutputOwnership.kind`）：
+
+| kind | 判定 | 处置 |
+|---|---|---|
+| `file` | 单一路径文件（视频编码 / stream copy / 音频 / 图片 / 校验和文件） | 每次尝试暂存到同目录临时文件 → 按媒体类型校验 → 一次性发布 → 失败整体回滚 |
+| `pipe` | `-`、`pipe:`、`fd:` | 保留普通流式语义，**不暂存** |
+| `other` | `-f null`、网络端点（`rtmp://…`）、已存在的设备/FIFO/socket 等非普通文件 | 从不暂存、从不发布 |
+| `unsafe` | **会写文件但无法用单一目标接管**：含 `%` 的编号 pattern，或 `segment/hls/dash/tee/webm_segment` 等多文件 muxer | **在任何文件被改写之前拒绝整条命令（`rc=78`）** |
+
+流程（`dispatch`）：分类 → 若有 `unsafe` 立即拒绝 → 把全部 `file` 目标交给 `_stage_cmd`（**硬件尝试、CPU 回退、流式命令三处都走同一 `file_outputs` 集合**）→ 校验（视频要求带尺寸的 `v:0`；音频/图片/stream copy 要求至少一条流；文本/校验和只要求非空）→ `_commit_outputs` 事务发布（预检目录/父目录/可写 → 硬链接备份 → `os.replace` → 失败/取消整体回滚）。
+
+- **无法安全接管即失败**：`unsafe` 目标、或在命令行中定位不到的输出 token，都在**任何进程启动之前**以 `rc=78` 明确失败并写 telemetry（`backend=gpu-failed`）。
+- **保留 ffmpeg 自身语义**：仅当「目标已存在且命令没有 `-y`」时仍 `_exec(cpu_cmd)`——此时 ffmpeg 自己会拒绝写入，不产生未保护写；`-y` 授权的正常覆盖语义不变。
+- **多文件 muxer 不再翻译**：`plan_output` 对 `_MULTIFILE_MUXERS` 返回 `none`，因此**纯 HLS/segment 命令不再被加速**，回到原有的未加速直通路径（不触发拒绝）；只有「GPU 视频输出 + 无法接管的文件输出」混合命令才会明确拒绝。
+- **多输出整体失败语义不变**：`_commit_outputs` 的预检/备份/回滚保证「多输出失败保留既有有效产物，绝不把部分发布当成功」，且**发布失败不会再跑 CPU 回退**。
+
+### 11.2 变更文件与提交
+
+- 实现 + 测试提交：`3268e8e fix(gpu): own every file output of an accelerated ffmpeg command`
+  - `lib/gpu/ffmpeg_args.py`：新增 `_MULTIFILE_MUXERS` / `_NONFILE_MUXERS` / `_TEXT_MUXERS` / `_SCHEME_RE`；`plan_output` 对多文件 muxer 返回 `none`；新增 `OutputOwnership` / `output_ownership()` / `own_outputs()`。
+  - `lib/gpu/ffmpeg_exec.py`：`_validate` 改为按 `(path, kind)` 的媒体类型校验；`_CannotStage` 增加 `kind`（`overwrite` / `absent`）；删除会吞掉原因的 `_stage_outputs`，新增 `_unowned_staging()`；`dispatch` 以 `own_outputs` 为所有权面，硬件尝试 / CPU 回退 / 流式分支统一暂存并发布；模块 docstring 同步。
+  - `tests/lib/test_gpu_dispatch_safety.py`：28 → 41 个用例（混合失败/成功、流式暂存、拒绝模式与多文件 muxer、无法定位、覆盖拒绝直通、媒体类型校验）。
+  - `tests/lib/test_gpu_ffmpeg_args.py`：新增 8 组所有权分类用例；多文件 muxer 加入「不翻译」参数表。
+- 未推送、未合并；工作区干净。
+
+### 11.3 独立前/后复现（混合输出）
+
+复现脚本自建（不覆盖复审方证据目录）：`/tmp/om/m2f/harness.py`，结果 `/tmp/om/m2f/{before,after}/results.json`。
+
+- **before 树** = `git show HEAD:lib/gpu/{ffmpeg_exec,ffmpeg_args}.py`（`eae7e49`，第 2 轮版本）落在私有 repo 根 `/tmp/om/m2f/before`，经真实 shim `gpu_native/shims/path/ffmpeg` 运行；**after 树** = 工作区（`3268e8e`）。
+- **两种运行时画像**，各自使用**私有 `OM_GPU_HOME`**（真实设备状态不被触碰）：
+  - `stub`：native ffmpeg 先照抄真实 MediaCodec 编码器清单，再对任何编码**必然失败** → 用真实子进程确定性地产生「硬件失败 → CPU 回退」；
+  - `real`：符号链接真实 native 运行时（`prefix/`、`bin/`、`manifest.json`）→ 真实硬件编码。
+- CPU ffmpeg 用日志包装脚本（`OM_GPU_REAL_FFMPEG`）逐次记录调用，native 桩同样记录 → 可精确核对尝试次数。
+
+**用例 1（复验方确认的混合输出失败）**
+
+```
+ffmpeg -v error -y -i <src> -t 1 -c copy existing.mp4 \
+       -t 1 -vn -c:a aac audio.m4a \
+       -t 1 -an -c:v libx264 -pix_fmt yuv420p missing/second.mp4
+```
+
+| | rc | `existing.mp4` | `audio.m4a` | `missing/` | 残留临时文件 |
+|---|---|---|---|---|---|
+| **before** | 1 | 20,897,137 B → **0 B**（SHA `47d46d72…` → `e3b0c442…`） | 18,784 B → **0 B** | 未创建 | 无 |
+| **after** | 1 | 20,897,137 B → **20,897,137 B，SHA 不变** | 18,784 B → **18,784 B，SHA 不变** | 未创建 | 无 |
+
+**用例 2–8** 汇总（`after` 未回归的一并列出）：
+
+| 用例 | before | after |
+|---|---|---|
+| 混合成功（copy+音频+GPU 视频，均授权覆盖） | rc=0，三产物全发布 | rc=0，三产物全发布；stream copy/音频**逐字节相同**（copy SHA `bde5489a…`、audio `0f69ee4a…`），视频 h264 1920×1080、音频 aac |
+| 取消（SIGTERM 命中 CPU 回退中） | rc=-15；`existing.mp4` 被改成 **4,048,620 B**（SHA `f6512d72…`，内容损坏） | rc=-15；`existing.mp4` **SHA 不变**；无存活写入者、无残留临时文件 |
+| 多输出失败（两个 GPU 输出，第二个目录缺失） | rc=1；`a.mp4` 保留 | rc=1；`a.mp4` 保留（第 2 轮行为，无回归） |
+| 发布被拒（目标为目录，真实硬件成功） | rc=1；`good.mp4` **被覆盖** | rc=1；`good.mp4` **保持原尺寸**；`blocked.mp4` 仍为目录；`backend=gpu-failed`；CPU 侧仅有 `-hide_banner -version` 探测，**未重跑编码** |
+| 流式（写 `pipe:1` + 文件输出） | rc=0；stdout 761,024 B；`copy.mp4` 1,598,286 B | rc=0；stdout **761,024 B**、mpegts h264；`copy.mp4` **SHA 相同**（`739c902e…`）；文件输出已暂存发布 |
+| 含编号 pattern 的混合命令 | rc=0，写出 `out.mp4` 与 `frame_0001/0002.png` | **rc=78**，`nothing was written`（目录内无任何产物） |
+| GPU 优先真实硬件编码 | rc=0；SHA `4db4336c…`；`backend=gpu`、`h264_mediacodec` | rc=0；**SHA 完全相同**；`backend=gpu`、`h264_mediacodec`、`c2.mtk.avc.encoder`；CPU 侧**零调用** |
+
+### 11.4 既有资产 SHA-256 校验
+
+- 失败/取消用例中，既有产物在 `after` 全部保持原 SHA-256：
+  - `existing.mp4`：`47d46d729e0881d37ea87e49a0d1cfb8277434bb58d66e0d51ac5163fd020dac`（20,897,137 B，前=后）
+  - `audio.m4a`：`484781420609973d9a7f061c96d9800a8df7a6a34990a4bb3c1986afaadab331`（18,784 B，前=后）
+  - 取消用例 `existing.mp4` 同为 `47d46d72…`（`before` 被改成 `f6512d72…` 且尺寸缩水）
+  - 发布被拒用例 `good.mp4` 尺寸与内容均未变
+- 成功用例中授权覆盖语义不变，多产物**同一事务**发布，无部分发布。
+- 设备真实 `OM_GPU_HOME` 未被写入；所有复现均在私有 `OM_GPU_HOME`（`/tmp/om/m2f/home-*`）与 `/tmp` 沙箱内完成。
+
+### 11.5 进程生命周期与发布证据
+
+- 取消用例 `after`：信号前活跃写入者只写**暂存路径**（`/usr/bin/ffmpeg … .om-gpu-<pid>-<hex>.mp4`）；`writers_after=[]`（无 ffmpeg 存活）、`leftovers=[]`（无残留暂存）；既有产物 SHA 不变 → 「取消不得发布、不得留下写入者」成立。
+- 发布被拒用例：CPU 侧日志只有 `-hide_banner -version`（参考实现语义探测），**没有**第二次编码 → 「发布失败不得再跑 CPU 回退」成立。
+- 全部用例的产物目录在结束后都不含 `.om-gpu-*` 临时文件或 `.bak`。
+- 硬件尝试与 CPU 回退仍各自 `start_new_session` + `PR_SET_PDEATHSIG`（第 2 轮成果，未改动）。
+
+### 11.6 回归测试
+
+- 4 个 GPU 模块：**127 passed**（`test_gpu_oop` 14 + `test_gpu_ffmpeg_args` 54 + `test_gpu_dispatch_safety` 41 + `test_gpu_remotion_runner` 6；前值 102）。
+- 全量：`.venv/bin/python -m pytest tests/ -q` → **2117 passed, 11 skipped, 3 xfailed**（EXIT=0；前值 2092 passed，增量 25 即本轮新增用例）。
+- 既有测试未弱化：`_stage_outputs` 的用例改写为直接断言 `_stage_cmd` 的新契约（覆盖拒绝 → `kind == "overwrite"`；token 缺失 → `kind == "absent"`），语义更严格；`test_dispatch_execs_directly_when_it_cannot_own_the_output` 拆分为「无法定位 → 拒绝」与「ffmpeg 自身拒绝覆盖 → 直通」两个更强的用例。
+
+### 11.7 GPU 优先与回退兼容
+
+- GPU 优先默认（`OM_GPU_MODE=auto`）与 Mali/MediaTek 硬件路径不变：真实硬件编码输出 SHA-256 前/后**完全一致**（`4db4336c…`），telemetry `backend=gpu`、`encoder=h264_mediacodec`、`device=c2.mtk.avc.encoder`；该次运行 CPU 侧**零调用**。
+- CPU 回退仍按第 2 轮语义工作：确定性构造「硬件失败 → CPU 回退成功」时全链路 rc=0、产物按媒体类型校验后发布（用例「混合成功」）。
+- 流式/管道语义保持：`pipe:1` 输出的**字节数与内容不变**；文件输出在流式命令中也被暂存并发布（管道本身不暂存）。
+- 未加速命令（stream copy/分析/音频/图片/多文件 muxer 单一输出）仍走原有的 CPU 直通快路径，shim 只做一次解析。
+
+### 11.8 剩余限制
+
+1. **新增的拒绝语义（刻意收紧）**：当一条**被加速**的命令同时含有无法接管的文件输出（编号 pattern 或多文件 muxer）时，命令以 `rc=78` 明确失败而不是继续执行未保护的直写。仓库现有工具不存在这种组合；纯 HLS/segment 命令因多文件 muxer 不再翻译而**照旧在 CPU 直通**，不受影响。
+2. 流式（读 stdin / 写 stdout）命令的文件输出现在也暂存与发布；其管道输出按定义不暂存、无回退。
+3. `-f null`、网络端点、设备/非普通文件目标不参与暂存（不视为可接管的文件输出），只保留其原有语义。
+4. 沿用第 2 轮限制：被 `SIGKILL` 的 dispatcher 无法运行清理，可能留下一个**非生产**暂存文件（无写入者存活）；`PR_SET_PDEATHSIG` 只绑定直接子进程；取消收敛时间取决于编码器对 `SIGTERM` 的响应。
+5. 「目标已存在且无 `-y`」仍直接 `_exec` 原命令（保留 ffmpeg 自身拒绝/提示语义）。
+6. **本报告不构成独立 L5 通过结论**；M1/M3 维持前两轮结论不变。
+
+### 11.9 复现步骤
+
+```bash
+# 前/后（同一脚本，脚本自建私有 repo 根与私有 OM_GPU_HOME，不写设备状态）
+python3 /tmp/om/m2f/harness.py before     # 复现截断/损坏
+python3 /tmp/om/m2f/harness.py after      # 全程保留既有资产
+# 逐用例对比
+python3 - <<'PY'
+import json
+b=json.load(open('/tmp/om/m2f/before/results.json'))
+a=json.load(open('/tmp/om/m2f/after/results.json'))
+print(b['mixed_fail']['asset_preserved'], a['mixed_fail']['asset_preserved'])
+PY
+
+# 回归
+.venv/bin/python -m pytest tests/lib/test_gpu_ffmpeg_args.py tests/lib/test_gpu_dispatch_safety.py -q
+.venv/bin/python -m pytest tests/ -q
+```
+
+### 11.10 提交
+
+- 补修提交：`3268e8e fix(gpu): own every file output of an accelerated ffmpeg command`
+- 变更文件：`lib/gpu/ffmpeg_args.py`、`lib/gpu/ffmpeg_exec.py`、`tests/lib/test_gpu_dispatch_safety.py`、`tests/lib/test_gpu_ffmpeg_args.py`
 - **未推送、未合并。**

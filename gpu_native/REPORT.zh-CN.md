@@ -182,6 +182,7 @@ proot 会追踪其下**每个**进程，因此每次原生 FFmpeg 启动都要�
 7. **一次未复现的卡死**：早前观察到一次**被追踪的**硬件编码在父进程被杀后卡在 `binder_thread_read`/`futex`（49 线程）并占住会话槽；随后 40+ 次编码（含被追踪与 worker 路径）均正常，未能归因于本次改动；worker 路径另有“客户端断开即杀子进程”的保护。
 8. **运行时位置**：`/data/data/com.termux/files/home/.openmontage-gpu` 不在 NO_DELETE 受保护列表中（我未修改该策略文件）；建议用户将其加入。
 9. 引导依赖本机 Termux apt 索引快照中的包版本；镜像下架旧版本时需刷新索引。
+10. **输出所有权收紧带来的拒绝语义**（`3268e8e`）：被加速的命令若同时含有无法接管的文件输出（编号 pattern 或多文件 muxer 如 `hls/segment/tee`），分发现以 `rc=78` 明确失败，而不是继续执行未保护的直写。这是刻意的安全收紧；仓库现有工具不含该组合，且纯多文件 muxer 命令不再被翻译、照旧在 CPU 直通。详见 `REMEDIATION.zh-CN.md` 第 11.8 节。
 
 ## 9. 状态：**PARTIAL**
 
@@ -192,10 +193,12 @@ proot 会追踪其下**每个**进程，因此每次原生 FFmpeg 启动都要�
 
 **L5 复审补修（`205a370`）后的状态变化**：独立复审确认 M1/M3 已闭合，但 **M2 仍阻断**——CPU 回退直接写生产路径（带 `-y`）、取消后其子进程存活并继续写、多输出失败会破坏既有资产。第二轮把「逐次尝试暂存 + 受控子进程（独立会话 + `PR_SET_PDEATHSIG` + 进程组信号转发）+ 事务化整组发布（预检 + 硬链接备份 + 回滚）+ 取消即弃」统一施加到硬件尝试与 CPU 回退之上，并以真实子进程复现前/后证据（失败/取消用例的既有产物 SHA-256 逐字节不变，回退写入者不再存活）。状态仍为 **PARTIAL**。详见 `gpu_native/REMEDIATION.zh-CN.md` 第 10 节。
 
+**L5 复审补修（`3268e8e`）后的状态变化**：最终复验指出第 2 轮事务仍只覆盖 `gpu_plans`——同一命令里的 **stream copy / 音频 / 图片** 等文件输出未被暂存，实测把既有 20,897,137 字节成片与其音频截断为 0 字节。第三轮改为对**整条命令的全部输出**先分类（单一路径文件 / 管道 / 非文件目标 / 无法接管），对全部单一路径文件输出统一做「逐次暂存 + 按媒体类型校验 + 事务化发布 + 失败回滚」（硬件尝试、CPU 回退、流式命令一致），**无法接管时在改写任何文件前以 `rc=78` 拒绝**。前/后实测：混合输出失败与取消用例的既有资产 SHA-256 逐字节不变、无残留临时文件与存活写入者，多输出成功仍同事务发布，真实硬件编码输出 SHA-256 不变且 `backend=gpu`。状态仍为 **PARTIAL**。详见 `gpu_native/REMEDIATION.zh-CN.md` 第 11 节。
+
 ## 10. 仓库状态、测试与复现
 
-- 分支 `feat/gpu-native-openmontage`；提交与 diff：`git log c135813..HEAD`、`git diff c135813..HEAD --stat`。L5 修复提交：`a6bbb27`（父 `585eed3`）；L5 复审补修（M2）：`205a370`。
-- 测试：新增 `tests/lib/test_gpu_ffmpeg_args.py`、`test_gpu_dispatch_safety.py`、`test_gpu_remotion_runner.py`、`test_gpu_oop.py`（命名空间映射与 worker 生命周期，14 项）；GPU 层 4 个文件在 M2 复审补修后共 **102 项全部通过**（`test_gpu_oop` 14 + `test_gpu_ffmpeg_args` 54 + `test_gpu_dispatch_safety` 28 + `test_gpu_remotion_runner` 6），其中 `test_gpu_dispatch_safety.py` 由 12 项扩到 **28 项**（新增 CPU 回退暂存/发布、取消、整组发布回滚、真实子进程生命周期）；全量 `pytest tests/ -q` 为 **2092 passed, 11 skipped, 3 xfailed**。
+- 分支 `feat/gpu-native-openmontage`；提交与 diff：`git log c135813..HEAD`、`git diff c135813..HEAD --stat`。L5 修复提交：`a6bbb27`（父 `585eed3`）；L5 复审补修（M2 生命周期）：`205a370`；L5 复审补修（M2 全命令输出所有权）：`3268e8e`。
+- 测试：新增 `tests/lib/test_gpu_ffmpeg_args.py`、`test_gpu_dispatch_safety.py`、`test_gpu_remotion_runner.py`、`test_gpu_oop.py`（命名空间映射与 worker 生命周期，14 项）；GPU 层 4 个文件在 M2 全命令输出所有权补修后共 **127 项全部通过**（`test_gpu_oop` 14 + `test_gpu_ffmpeg_args` 54 + `test_gpu_dispatch_safety` 41 + `test_gpu_remotion_runner` 6），其中 `test_gpu_dispatch_safety.py` 由 12 项扩到 **28 项**（第 2 轮）再到 **41 项**（第 3 轮：混合输出暂存/发布、流式命令的文件输出暂存、编号 pattern 与多文件 muxer 拒绝、无法定位即拒绝、覆盖拒绝直通、媒体类型校验）；全量 `pytest tests/ -q` 为 **2117 passed, 11 skipped, 3 xfailed**。
 - 复现：`bash gpu_native/scripts/bootstrap_runtime.sh && bash gpu_native/scripts/bootstrap_browser.sh`；证据：`python gpu_native/tools/collect_evidence.py <dir>`；基准：`gpu_native/bench/final_suite.py`、`parity_matrix.py`、`soak.py`；免 proot A/B：`gpu_native/bench/oop_ab.py`（交错、中位数）与 `oop_bench.py`（每次启动开销），结果见 `results/proot_free_ab.json`。
 - 新增环境开关：`OM_GPU_OOP`（默认 `auto`；`0`/`off` 关闭）、`OM_GPU_OOP_WAIT_S`（默认 2.5）、`OM_GPU_OOP_TIMEOUT_S`（默认 3600）。所有开关只影响本工程的执行路径选择，不改变任何输出契约。
 - Develop Record：`DEVELOP_RECORD = REQUIRED`，但 openmontage 无受治理绑定（候选为无关项目）；按协议未创建项目/模块/Slice，**本次未写入开发记录**。

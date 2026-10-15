@@ -89,6 +89,8 @@ AV-2997 mode=auto rc=0 -> High / yuv420p range=tv
 
 ## 2. 发现二：硬件编码器孤儿与输出所有权
 
+> **注意：** 本节记录**第一轮**修复（`a6bbb27`），只闭合了「硬件编码直接孤儿」。独立复审确认 **M2 仍阻断**（CPU 回退直接写生产路径、取消后回退子进程存活、多输出失败破坏既有资产）。第二轮补修见 **第 10 节**（提交 `205a370`），本节结论以第 10 节为准。
+
 ### 2.1 根因（三处，缺一不可）
 
 1. `gpu_native/worker/om_gpu_worker.py`：编码子进程**没有登记**；`SIGTERM/SIGINT` 处理直接 `os._exit(0)`，不会终止正在运行的编码；编码从 handler 线程派生，没有 `PR_SET_PDEATHSIG` 兜底 → worker 消失后编码器**继续存活并写文件**。
@@ -266,7 +268,122 @@ OM_M2_WORKER=/tmp/om/om_gpu_worker_old.py .venv/bin/python /tmp/om/m2_verify.py 
 
 ## 9. 提交
 
-- 修复提交：`a6bbb27 fix(gpu): close the three blocking L5 findings (format, orphan, fonts)`
-- 父提交（被阻断版本）：`585eed3 feat(gpu): PRoot-free native execution for solo hardware encodes`
-- 变更文件：`lib/gpu/ffmpeg_args.py`、`lib/gpu/ffmpeg_exec.py`、`lib/gpu/oop.py`、`gpu_native/worker/om_gpu_worker.py`、`tests/lib/test_gpu_ffmpeg_args.py`、`tests/lib/test_gpu_dispatch_safety.py`
+- 第一轮修复提交：`a6bbb27 fix(gpu): close the three blocking L5 findings (format, orphan, fonts)`
+  - 父提交（被阻断版本）：`585eed3 feat(gpu): PRoot-free native execution for solo hardware encodes`
+  - 变更文件：`lib/gpu/ffmpeg_args.py`、`lib/gpu/ffmpeg_exec.py`、`lib/gpu/oop.py`、`gpu_native/worker/om_gpu_worker.py`、`tests/lib/test_gpu_ffmpeg_args.py`、`tests/lib/test_gpu_dispatch_safety.py`
+- 第二轮（M2 复审补修）提交：`205a370 fix(gpu): stage the CPU fallback and own its lifecycle`（见第 10 节）
+  - 变更文件：`lib/gpu/ffmpeg_exec.py`、`tests/lib/test_gpu_dispatch_safety.py`
+- **未推送、未合并。**
+
+---
+
+## 10. M2 复审补修（第二轮）：CPU 回退的进程生命周期与产物所有权
+
+第一轮修复（`a6bbb27`）闭合了「硬件编码直接孤儿」，独立复审确认 **M2 仍阻断**：*失败回退* 仍会破坏既有资产。本节记录第二轮的根因、修复、独立前/后复现与回归证据。
+
+### 10.1 复审阻断项（三处已复现的 MAJOR 子例）
+
+1. **取消 → CPU 回退继续写**：硬件编码被 `SIGKILL` → 进入 CPU 回退；回退命令**直接写最终路径**（带 `-y`），先把既有 `existing.mp4` 截断/覆盖；此时 dispatcher 收到 `SIGTERM`（`rc=-15`），CPU 子进程因**没有 `PR_SET_PDEATHSIG`、不在独立进程组**而**继续存活并写**，20,897,137 字节的既有产物被换成数十/数百字节。
+2. **多输出中途失败**：第二个输出的父目录不存在时，CPU 回退直接写，先截断**已存在的第一个输出**，再在第二个上失败 → 第一个既有产物变成 **0 字节**。
+3. **整组发布失败被部分提交**：第二个输出目标是目录时，`_commit_outputs` 逐个发布，发布完第一个后失败；`_remove_partial` 进一步把「已被改动」的第一个输出删除，随后 CPU 回退再次截断 → **0 字节**。
+
+### 10.2 根因
+
+`lib/gpu/ffmpeg_exec.py` 的 CPU 回退分支（原第 462 行）用 `subprocess.run(cpu_cmd, env=_cpu_env())` **直接运行原始未翻译命令**：无暂存、无独立会话、无 `PR_SET_PDEATHSIG`、无信号转发、无事务化发布。由此：
+
+- 回退的写入者直接落在**生产路径**上，失败/取消即破坏既有资产；
+- 回退子进程不随 dispatcher 退出而结束，成为「被遗弃的写入者」，可与后续重试并发写同一目标；
+- `_commit_outputs` 逐项发布、**无回滚** → 部分发布被误当成可清理的中间态，进一步破坏旧产物。
+
+### 10.3 修复：统一所有权模型（改动全部在 `lib/gpu/ffmpeg_exec.py`）
+
+**同一套契约同时约束硬件尝试与 CPU 回退：**
+
+1. **逐次尝试暂存**：新增 `_stage_cmd(cmd, targets, has_y)`，把每个非管道输出重定向到同目录唯一临时名 `.om-gpu-<pid>-<rand><ext>`；`_stage_outputs` 作为薄包装保留原签名（无法定位输出或「已有文件且无 `-y`」时抛 `_CannotStage` → 返回 `None`）。**硬件尝试与 CPU 回退各自使用全新的临时名**，两次尝试永不共享目的地。
+2. **无法拥有则直接 exec**：若无法为必需的文件输出建立所有权（已有文件且无 `-y`、或输出 token 无法定位），不再运行「可回退的中间过程」，而是 `_exec(cpu_cmd)`——该进程**就是**唯一写入者，取消即直接杀死它，没有任何后续回退会与它竞争。`-y` 的覆盖确认语义原样保留。
+3. **受控子进程**：新增 `_run_owned(cmd, env, capture_stderr)` = `start_new_session=True` + `preexec_fn=_set_pdeathsig`（`PR_SET_PDEATHSIG=SIGKILL`），由 dispatcher 统一登记活动进程组；硬件尝试与 CPU 回退都经它运行。
+4. **取消感知**：加速段安装 `SIGTERM/SIGINT/SIGHUP` 处理器，把信号转发给**整个进程组**（`os.killpg`）并置取消标志；所有发布点先检查标志，一旦取消就**丢弃暂存、绝不发布**，随后 `_die_by_signal` 按原信号退出（退出状态与直接被信号终止一致）。重复信号升级为 `SIGKILL`。
+5. **事务化发布 `_commit_outputs`**：先对**全部**目标预检（目标是目录 / 父目录缺失 / 父目录不可写）→ 命中即**不触碰任何文件**直接报错；再用硬链接（文件系统不支持时退化为 rename）为每个既有最终文件建立同 inode 备份，逐个 `os.replace` 发布并沿用原有权限位；任一步失败或期间被取消 → **回滚**（已发布者还原旧字节，未发布者的冗余备份仅删除），**绝不把部分发布报告为成功**。
+6. **发布失败不触发 CPU 回退**：硬件尝试成功、仅发布阶段被拒（目标问题而非编码问题）时直接失败返回，**不再重跑一次 CPU 编码**（避免对同一目录再次动手）。
+7. **远端→受追踪不共享临时名**：`_run_native_remote` 改为返回 `(attempted, result)`；远端「已启动但出错」时，受追踪兜底通过 `restage` 回调改用**全新临时名**，杜绝两个写入者共用一个输出路径。
+
+`_snapshot` / `_remove_partial` / `_discard_outputs` 的签名与原有测试契约保持不变；`_remove_partial` 调用点保留为纵深防御（暂存后它已是安全空操作）。
+
+### 10.4 独立前/后复现（真实子进程 + 真实视频输出）
+
+用 `/tmp/om/m2r/repro.py` 复刻复审方三处用例（**同 argv、同故障注入、同断言**），仅把输出目录改到 `/tmp/om/m2r/<label>` 以免覆盖复审方证据。源素材 `assets/signal-from-tomorrow-demo.mp4`（1920×1080/30fps，20,897,137 字节，SHA-256 `47d46d…20dac`）。BEFORE = `git checkout HEAD -- lib/gpu/ffmpeg_exec.py`（`974c4f3`）；AFTER = 本轮补修。
+
+| 用例 | 修复前 | 修复后 |
+|---|---|---|
+| dispatcher `SIGTERM`（硬件 SIGKILL→CPU 回退） | CPU 目标 = `existing.mp4`（**不是临时名**）；`cpu_survived_dispatcher_cancel=true`；20897137 → **48 字节**；`dispatcher_rc=-15`；旧资产**被破坏** | CPU 目标 = `.om-gpu-29660-9386aa6b.mp4`（**临时名**）；`cpu_survived_dispatcher_cancel=false`；20897137 不变；`dispatcher_rc=-15`；旧资产**逐字节保留** |
+| dispatcher `SIGKILL`（处理器无法运行） | CPU 子进程**存活**并继续写；旧资产被破坏 | CPU 子进程随之**消失**（PDEATHSIG）；旧资产保留 |
+| CPU 回退子进程被直接 `SIGTERM` | `rc=255`；20897137 → **2481 字节** | `rc=255`；20897137 **不变** |
+| 多输出、第二个父目录缺失 | `rc=1`；既有第一个输出 → **0 字节** | `rc=1`；既有输出 **20897137 不变**；报 `cpu fallback produced no usable output` |
+| 第二个目标是目录（发布被拒） | `rc=1`；既有输出 → **0 字节** | `rc=1`；既有输出 **不变**；报 `could not publish …: target is a directory`；**未再跑 CPU 回退** |
+| 授权成功的 CPU 回退（硬件损坏、CPU 可修） | `rc=0`，产出有效视频 | `rc=0`，产出有效视频（1920×1080 h264，837,674 字节） |
+| 取消后重试 | `rc=0`，产出有效 | `rc=0`，产出有效；无临时残留 |
+
+SHA-256 对照：修复后上述**失败/取消**用例的既有产物 SHA-256 与原始值**完全一致**（`47d46d729e0881d37ea87e49a0d1cfb8277434bb58d66e0d51ac5163fd020dac`），即「失败 / 被取消的执行不改变既有有效产物」得到逐字节证明。
+
+### 10.5 进程生命周期证据
+
+- **生产实证**：修复后 CPU 回退的真实 argv 输出目标是**暂存名**——`/usr/bin/ffmpeg … /tmp/om/m2r/after/cancel/.om-gpu-29660-9386aa6b.mp4`，不是最终文件。
+- 取消时 dispatcher 将 `SIGTERM` 转发给回退子进程的**整个进程组**，子进程在 1 秒内消失；`SIGKILL` dispatcher（处理器无法运行）时子进程仍因 `PR_SET_PDEATHSIG=SIGKILL` 立即终止 → **无被遗弃的写入者**。
+- 单测 `test_owned_child_leads_its_session_and_carries_pdeathsig` 实测子进程 `sid==pid` 且 `PR_GET_PDEATHSIG==SIGKILL`；`test_owned_child_is_killed_when_its_dispatcher_dies` 用**真实子进程**在 dispatcher 被 `SIGKILL` 后验证子进程不存活。
+
+### 10.6 回归测试
+
+`tests/lib/test_gpu_dispatch_safety.py` 由 12 项扩到 **28 项**，新增覆盖复审指出未覆盖的三类：
+
+- **暂存**：`test_stage_cmd_returns_pairs_for_a_cpu_command`、`test_stage_cmd_raises_when_it_cannot_own_the_destination`、`test_two_attempts_never_share_a_destination`
+- **整组发布失败与回滚**：`test_commit_refuses_a_directory_target_before_touching_anything`、`test_commit_refuses_a_missing_output_directory`、`test_commit_rolls_back_when_a_later_publish_fails`、`test_commit_aborts_and_restores_when_the_job_was_cancelled`、`test_commit_keeps_the_preexisting_file_mode`
+- **子进程生命周期**：`test_owned_child_leads_its_session_and_carries_pdeathsig`、`test_owned_child_is_killed_when_its_dispatcher_dies`
+- **CPU 回退端到端**：`test_dispatch_cpu_fallback_stages_then_publishes`（回退经临时名发布、无残留、`backend=cpu`）、`test_dispatch_cpu_fallback_failure_leaves_the_old_asset`（回退失败绝不覆盖旧资产）、`test_dispatch_does_not_rerun_the_encoder_when_publish_is_refused`（发布被拒不重跑）、`test_dispatch_execs_directly_when_it_cannot_own_the_output`（无法拥有则直接 exec）
+- **远端→受追踪不共享写入者**：`test_traced_fallback_restages_when_the_remote_attempt_errored`、`test_restage_is_skipped_when_no_remote_run_started`
+
+结果：该文件 **28 passed**；GPU 四个定向模块（`test_gpu_oop` 14 + `test_gpu_ffmpeg_args` 54 + `test_gpu_dispatch_safety` 28 + `test_gpu_remotion_runner` 6）**102 passed**；全量 `pytest tests/ -q` **`2092 passed, 11 skipped, 3 xfailed`**（第一轮为 `2075 passed, 11 skipped, 3 xfailed`；本轮 `test_gpu_dispatch_safety.py` 由 12 项扩到 28 项）。
+
+### 10.7 GPU 优先与回退回归
+
+同一 1080p 素材（`-t 6 -an -c:v libx264 -crf 23 -preset medium -pix_fmt yuv420p`），`OM_GPU_MODE=auto`：
+
+| 版本 | traced 中位数 | 硬件输出 SHA-256 | backend / encoder | worker 路径 |
+|---|---|---|---|---|
+| 修复前（`974c4f3`） | 5.10 s | `c126338d…d1ad` | gpu / `h264_mediacodec` | 2.24 s，SHA 相同，`oop=true` |
+| 修复后 | 4.44 s | `c126338d…d1ad` | gpu / `h264_mediacodec` | 2.08 s，SHA 相同，`oop=true` |
+
+硬件输出**逐字节一致**，仍为 `c2.mtk.avc.encoder`、`backend=gpu`；差异在噪声范围内（本轮改动只在启动/收尾路径，不进入逐帧编码循环）。
+
+**流式/管道路径回归**（该路径的子进程现在同样经 `_run_owned` 独立会话运行）：`ffmpeg … -f mp4 … pipe:1 > out.mp4`（`writes_stdout`）与 `cat in.mp4 | ffmpeg -i pipe:0 …`（`reads_stdin`）均 `rc=0`、输出为有效 1920×1080 h264、遥测 `backend=gpu, streaming=true, encoder=h264_mediacodec` 保持不变。
+
+### 10.8 剩余局限
+
+1. dispatcher 被 `SIGKILL`（或工具级超时强杀）时无法运行清理，可能留下一个 `.om-gpu-*` 暂存文件；**它不会是生产文件、也没有任何写入者存活**（本次实测 `leftover_temps` 仅此一个，且只见于 `SIGKILL` 用例）。属可接受的、非破坏性残留。
+2. `PR_SET_PDEATHSIG` 只绑定**直接子进程**（与复审方观察一致）；本次未发现实际 FFmpeg 派生的编码孙进程，故未对「泛用 Python 子孙边界」做额外处理。
+3. 取消收敛依赖 FFmpeg 对 `SIGTERM` 的正常退出；若某编码器忽略 `SIGTERM`，重复信号会升级为 `SIGKILL`，但首次取消的收敛时间由编码器决定。
+4. GPU 流式/管道输出无暂存与回退（设计如此）；其子进程存活由 `PR_SET_PDEATHSIG` 绑定。
+5. 本报告**不构成独立 L5 通过结论**；M1/M3 维持第一轮结论不变。
+
+### 10.9 复现步骤
+
+```bash
+# 前/后（同一脚本，仅输出目录不同）
+git checkout HEAD -- lib/gpu/ffmpeg_exec.py
+python3 /tmp/om/m2r/repro.py before           # 复现三处破坏
+cp /tmp/om/m2r/ffmpeg_exec.fixed.py lib/gpu/ffmpeg_exec.py
+python3 /tmp/om/m2r/repro.py after            # 全程保留旧资产
+
+# GPU 优先 / 性能 A/B
+python3 /tmp/om/m2r/perf.py fixed             # backend=gpu, SHA=c126338d…
+git checkout HEAD -- lib/gpu/ffmpeg_exec.py && python3 /tmp/om/m2r/perf.py base
+cp /tmp/om/m2r/ffmpeg_exec.fixed.py lib/gpu/ffmpeg_exec.py
+
+# 回归
+.venv/bin/python -m pytest tests/lib/test_gpu_dispatch_safety.py -q
+```
+
+### 10.10 提交
+
+- 补修提交：`205a370 fix(gpu): stage the CPU fallback and own its lifecycle`
+- 变更文件：`lib/gpu/ffmpeg_exec.py`、`tests/lib/test_gpu_dispatch_safety.py`
 - **未推送、未合并。**

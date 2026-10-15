@@ -190,10 +190,12 @@ proot 会追踪其下**每个**进程，因此每次原生 FFmpeg 启动都要�
 
 **L5 修复（`a6bbb27`）后的状态变化**：三个阻断项已闭合，GPU 优先默认与硬件路径、CPU 回退均保持；其中 M1 使“未显式 `-pix_fmt`”的工作负载按正确性保留在 CPU（见第 7 节新增行），M3 使文字栅格化命令走受追踪原生路径（仍硬件编码）。状态仍为 **PARTIAL**，但不再包含上述三项阻断。详见 `gpu_native/REMEDIATION.zh-CN.md`。
 
+**L5 复审补修（`205a370`）后的状态变化**：独立复审确认 M1/M3 已闭合，但 **M2 仍阻断**——CPU 回退直接写生产路径（带 `-y`）、取消后其子进程存活并继续写、多输出失败会破坏既有资产。第二轮把「逐次尝试暂存 + 受控子进程（独立会话 + `PR_SET_PDEATHSIG` + 进程组信号转发）+ 事务化整组发布（预检 + 硬链接备份 + 回滚）+ 取消即弃」统一施加到硬件尝试与 CPU 回退之上，并以真实子进程复现前/后证据（失败/取消用例的既有产物 SHA-256 逐字节不变，回退写入者不再存活）。状态仍为 **PARTIAL**。详见 `gpu_native/REMEDIATION.zh-CN.md` 第 10 节。
+
 ## 10. 仓库状态、测试与复现
 
-- 分支 `feat/gpu-native-openmontage`；提交与 diff：`git log c135813..HEAD`、`git diff c135813..HEAD --stat`。L5 修复提交：`a6bbb27`（父 `585eed3`）。
-- 测试：新增 `tests/lib/test_gpu_ffmpeg_args.py`、`test_gpu_dispatch_safety.py`、`test_gpu_remotion_runner.py`、`test_gpu_oop.py`（命名空间映射与 worker 生命周期，14 项）；L5 修复后复跑 GPU 层 4 个文件共 **80 项全部通过**（`.venv/bin/python -m pytest -q tests/lib/test_gpu_oop.py tests/lib/test_gpu_ffmpeg_args.py tests/lib/test_gpu_dispatch_safety.py tests/lib/test_gpu_remotion_runner.py`）；全量 `pytest tests/ -q` 为 **2075 passed, 11 skipped, 3 xfailed**。
+- 分支 `feat/gpu-native-openmontage`；提交与 diff：`git log c135813..HEAD`、`git diff c135813..HEAD --stat`。L5 修复提交：`a6bbb27`（父 `585eed3`）；L5 复审补修（M2）：`205a370`。
+- 测试：新增 `tests/lib/test_gpu_ffmpeg_args.py`、`test_gpu_dispatch_safety.py`、`test_gpu_remotion_runner.py`、`test_gpu_oop.py`（命名空间映射与 worker 生命周期，14 项）；GPU 层 4 个文件在 M2 复审补修后共 **102 项全部通过**（`test_gpu_oop` 14 + `test_gpu_ffmpeg_args` 54 + `test_gpu_dispatch_safety` 28 + `test_gpu_remotion_runner` 6），其中 `test_gpu_dispatch_safety.py` 由 12 项扩到 **28 项**（新增 CPU 回退暂存/发布、取消、整组发布回滚、真实子进程生命周期）；全量 `pytest tests/ -q` 为 **2092 passed, 11 skipped, 3 xfailed**。
 - 复现：`bash gpu_native/scripts/bootstrap_runtime.sh && bash gpu_native/scripts/bootstrap_browser.sh`；证据：`python gpu_native/tools/collect_evidence.py <dir>`；基准：`gpu_native/bench/final_suite.py`、`parity_matrix.py`、`soak.py`；免 proot A/B：`gpu_native/bench/oop_ab.py`（交错、中位数）与 `oop_bench.py`（每次启动开销），结果见 `results/proot_free_ab.json`。
 - 新增环境开关：`OM_GPU_OOP`（默认 `auto`；`0`/`off` 关闭）、`OM_GPU_OOP_WAIT_S`（默认 2.5）、`OM_GPU_OOP_TIMEOUT_S`（默认 3600）。所有开关只影响本工程的执行路径选择，不改变任何输出契约。
 - Develop Record：`DEVELOP_RECORD = REQUIRED`，但 openmontage 无受治理绑定（候选为无关项目）；按协议未创建项目/模块/Slice，**本次未写入开发记录**。

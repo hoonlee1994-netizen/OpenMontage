@@ -23,6 +23,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from lib.gpu import delivery as delivery_mod
 from lib.gpu import runtime, telemetry
 
 COMPOSER_DIR = runtime.REPO_ROOT / "remotion-composer"
@@ -243,19 +244,72 @@ class _DegradedRender(RuntimeError):
         self.processes = processes
 
 
-def run_render(base_cmd: list[str], *, cwd: Path, timeout: Optional[int], runner) -> dict[str, Any]:
+def run_render(base_cmd: list[str], *, cwd: Path, timeout: Optional[int], runner,
+               output: "Path | str | None" = None, finalize=None) -> dict[str, Any]:
     """Run a Remotion CLI render GPU-first with automatic CPU fallback.
 
     ``base_cmd`` is the caller's ``npx remotion render ...`` command without
     browser/binaries flags; ``runner(cmd, timeout=, cwd=)`` executes it and
     raises on failure (``BaseTool.run_command``). Returns an execution record
     for the ToolResult.
+
+    ``output`` is the path the command renders to (as it appears in
+    ``base_cmd``, either as a bare token or as ``--output=``). When it names an
+    existing file -- a deliverable that is about to be re-rendered -- the render
+    *owns* it: every attempt renders into its own fresh hidden sibling of
+    ``output``, so a failed, cancelled or abandoned attempt, and a degraded GPU
+    attempt that is redone on the CPU, can never leave a truncated or superseded
+    file where a valid one was, and only the attempt that succeeded and
+    verified is published over ``output``, atomically. A render into a path
+    that does not exist yet has no asset to protect and writes it directly.
+
+    ``finalize(path)`` is a further step of the same delivery (e.g. muxing the
+    approved audio into the render): it runs on the successful attempt's file
+    *before* anything is published, so a failure in it, like a failure of the
+    render itself, leaves the existing deliverable untouched. It requires
+    ``output``.
     """
+    if output is None:
+        if finalize is not None:
+            raise ValueError("a finalize step needs the render's output path")
+        return _run_attempts(base_cmd, cwd=cwd, timeout=timeout, runner=runner, delivery=None)
+    with delivery_mod.Delivery(output, only_existing=True) as delivery:
+        rec = _run_attempts(base_cmd, cwd=cwd, timeout=timeout, runner=runner, delivery=delivery)
+        if finalize is not None:
+            target = delivery.current if delivery.staging else delivery.requested
+            if target and os.path.isfile(target):  # a renderer that wrote nothing has nothing to finalize
+                finalize(target)
+        try:
+            published = delivery.publish(require_output=False)
+        except delivery_mod.DeliveryError as exc:
+            telemetry.record({"kind": "job", "op": "remotion_render", "backend": "delivery-failed",
+                              "fallback_reason": str(exc)[-300:], "output": str(delivery.final)})
+            raise
+        rec["delivery"] = {"mode": "staged" if delivery.staging else "direct",
+                           "attempts": delivery.attempts, "published": published}
+        if not published:
+            rec["warning"] = (rec.get("warning", "") + " " if rec.get("warning") else "") + \
+                "the render reported success but wrote nothing to its staged destination; the output was not replaced"
+        return rec
+
+
+def _run_attempts(base_cmd: list[str], *, cwd: Path, timeout: Optional[int], runner,
+                  delivery) -> dict[str, Any]:
+    """The GPU-then-CPU attempts of :func:`run_render` (see there)."""
+    def attempt_cmd() -> list[str]:
+        """The caller's command, aimed at a fresh attempt destination when the render owns its output."""
+        if delivery is None:
+            return base_cmd
+        staged = delivery.begin()
+        if not delivery.staging:
+            return base_cmd  # nothing to protect: render straight to the new path
+        return delivery_mod.retarget(base_cmd, delivery.requested, staged)
+
     t0 = time.time()
     decision = plan()
     attempts = []
     if decision["gpu"]:
-        cmd = with_flags(base_cmd, render_flags(gpu=True))
+        cmd = with_flags(attempt_cmd(), render_flags(gpu=True))
         render_id = f"{os.getpid()}-{time.time_ns()}"
         try:
             # Bring the proot-free encode worker up now: the render's frames
@@ -301,6 +355,8 @@ def run_render(base_cmd: list[str], *, cwd: Path, timeout: Optional[int], runner
             raise
         except Exception as exc:  # GPU-specific failure: fall back below
             detail = (getattr(exc, "detail", "") or str(exc))[-600:]
+            if delivery is not None:
+                delivery.abandon_attempt()  # the failed/degraded attempt's output is never delivered
             if isinstance(exc, _DegradedRender):
                 detail = f"GPU process fell back to CPU compositing mid-render ({exc})"
                 attempts.append({"backend": "gpu-degraded", "error": detail, "gpu_processes": exc.processes})
@@ -316,7 +372,7 @@ def run_render(base_cmd: list[str], *, cwd: Path, timeout: Optional[int], runner
         if runtime.mode() == "require":
             raise RuntimeError(f"OM_GPU_MODE=require but GPU Remotion path unavailable: {decision['reason']}")
         fallback_reason = decision["reason"]
-    cmd = with_flags(base_cmd, render_flags(gpu=False))
+    cmd = with_flags(attempt_cmd(), render_flags(gpu=False))
     runner(cmd, timeout=timeout, cwd=cwd)
     if attempts:
         # The CPU path succeeded where the GPU path failed: GPU-specific.

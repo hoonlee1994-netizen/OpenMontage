@@ -342,6 +342,7 @@ class RemotionCaptionBurn(BaseTool):
 
         gpu_execution = remotion_gpu.run_render(
             render_cmd, cwd=root, timeout=None, runner=self.run_command,
+            output=Path(output_path).resolve(),
         )
 
         if not Path(output_path).exists():

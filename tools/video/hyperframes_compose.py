@@ -25,6 +25,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from lib.gpu.delivery import Delivery, DeliveryError
 from tools.base_tool import (
     BaseTool,
     Determinism,
@@ -859,34 +860,42 @@ class HyperFramesCompose(BaseTool):
             inputs.get("profile"), inputs.get("fps", 30)
         )
         quality = inputs.get("quality", "standard")
-        args = [
-            "render",
-            "--output", str(output_path),
-            "--fps", str(fps),
-            "--quality", quality,
-        ]
-        proc = self._run_hf(args, cwd=workspace, timeout=1800, check=False)
-        steps["render"] = {
-            "exit_code": proc.returncode,
-            "stdout_tail": (proc.stdout or "")[-4000:],
-            "stderr_tail": (proc.stderr or "")[-4000:],
-        }
-        if proc.returncode != 0:
-            return ToolResult(
-                success=False,
-                error=f"hyperframes render exit {proc.returncode}",
-                data={"steps": steps},
-            )
+        # Over an existing file the render writes a staged sibling that replaces
+        # it only after it succeeded and verified (lib/gpu/delivery.py).
+        with Delivery(output_path, only_existing=True) as delivery:
+            args = [
+                "render",
+                "--output", delivery.begin(),
+                "--fps", str(fps),
+                "--quality", quality,
+            ]
+            proc = self._run_hf(args, cwd=workspace, timeout=1800, check=False)
+            steps["render"] = {
+                "exit_code": proc.returncode,
+                "stdout_tail": (proc.stdout or "")[-4000:],
+                "stderr_tail": (proc.stderr or "")[-4000:],
+            }
+            if proc.returncode != 0:
+                return ToolResult(
+                    success=False,
+                    error=f"hyperframes render exit {proc.returncode}",
+                    data={"steps": steps},
+                )
 
-        if not output_path.exists():
-            return ToolResult(
-                success=False,
-                error=(
-                    f"hyperframes render exited 0 but output file missing: "
-                    f"{output_path}. Check stdout_tail for the real path."
-                ),
-                data={"steps": steps},
-            )
+            produced = delivery.current if delivery.staging else str(output_path)
+            if not (produced and os.path.exists(produced)):
+                return ToolResult(
+                    success=False,
+                    error=(
+                        f"hyperframes render exited 0 but output file missing: "
+                        f"{output_path}. Check stdout_tail for the real path."
+                    ),
+                    data={"steps": steps},
+                )
+            try:
+                delivery.publish()
+            except DeliveryError as exc:
+                return ToolResult(success=False, error=str(exc), data={"steps": steps})
 
         return ToolResult(
             success=True,
@@ -956,31 +965,37 @@ class HyperFramesCompose(BaseTool):
             inputs.get("profile"), inputs.get("fps", 30)
         )
         quality = inputs.get("quality", "standard")
-        args = [
-            "render",
-            "--output", str(output_path),
-            "--fps", str(fps),
-            "--quality", quality,
-            "--strict",
-        ]
-        proc = self._run_hf(args, cwd=workspace, timeout=1800, check=False)
-        steps["render"] = {
-            "exit_code": proc.returncode,
-            "stdout_tail": (proc.stdout or "")[-4000:],
-            "stderr_tail": (proc.stderr or "")[-4000:],
-        }
-        if proc.returncode != 0:
-            return ToolResult(
-                success=False,
-                error=f"hyperframes render exit {proc.returncode}",
-                data={"steps": steps},
-            )
-        if not output_path.is_file():
-            return ToolResult(
-                success=False,
-                error=f"HyperFrames exited 0 but output is missing: {output_path}",
-                data={"steps": steps},
-            )
+        with Delivery(output_path, only_existing=True) as delivery:
+            args = [
+                "render",
+                "--output", delivery.begin(),
+                "--fps", str(fps),
+                "--quality", quality,
+                "--strict",
+            ]
+            proc = self._run_hf(args, cwd=workspace, timeout=1800, check=False)
+            steps["render"] = {
+                "exit_code": proc.returncode,
+                "stdout_tail": (proc.stdout or "")[-4000:],
+                "stderr_tail": (proc.stderr or "")[-4000:],
+            }
+            if proc.returncode != 0:
+                return ToolResult(
+                    success=False,
+                    error=f"hyperframes render exit {proc.returncode}",
+                    data={"steps": steps},
+                )
+            produced = delivery.current if delivery.staging else str(output_path)
+            if not (produced and os.path.isfile(produced)):
+                return ToolResult(
+                    success=False,
+                    error=f"HyperFrames exited 0 but output is missing: {output_path}",
+                    data={"steps": steps},
+                )
+            try:
+                delivery.publish()
+            except DeliveryError as exc:
+                return ToolResult(success=False, error=str(exc), data={"steps": steps})
         if self._file_digest(entry) != original_digest:
             return ToolResult(
                 success=False,

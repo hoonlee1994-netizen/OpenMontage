@@ -33,6 +33,7 @@ from __future__ import annotations
 import contextlib
 import json
 import hashlib
+import os
 import logging
 import secrets
 import shutil
@@ -452,6 +453,52 @@ class VideoCompose(BaseTool):
             artifacts=[str(video_path)],
         )
 
+    class _PostRenderFailure(Exception):
+        """A step that follows the render (and belongs to its delivery) failed; carries its ToolResult."""
+
+        def __init__(self, result: "ToolResult"):
+            super().__init__(result.error)
+            self.result = result
+
+    def _audio_finalizer(self, audio_path):
+        """A ``run_render`` finalize step muxing the approved mix into the staged render.
+
+        It runs before the render is published, so a failure here cannot replace
+        an existing deliverable with an audio-less render.
+        """
+        def finalize(staged: str) -> None:
+            result = self._mux_external_audio(Path(staged), audio_path)
+            if not result.success:
+                result.data["post_render_failure"] = True
+                raise VideoCompose._PostRenderFailure(result)
+
+        return finalize
+
+    def _run_ffmpeg_to(self, cmd: list[str], output_path: Path) -> str:
+        """Run an ffmpeg ``cmd`` (given without its output) so that it delivers ``output_path``.
+
+        When ``output_path`` already holds a file the command writes a staged
+        sibling that replaces it only after the command succeeded and the result
+        verified (``lib/gpu/delivery.py``), so a failed, cancelled or killed run
+        leaves the existing deliverable exactly as it was. A path that does not
+        exist yet is written directly, as before. Returns the path the command
+        wrote (the staged sibling, or ``output_path`` itself), so the caller can
+        correlate execution telemetry with the step.
+        """
+        from lib.gpu.delivery import Delivery
+
+        inputs = {os.path.realpath(cmd[i + 1]) for i, tok in enumerate(cmd[:-1]) if tok == "-i"}
+        if os.path.realpath(output_path) in inputs:
+            # Writing a file over its own input is an error FFmpeg reports
+            # itself; staging would silently turn it into an in-place rewrite.
+            self.run_command([*cmd, str(output_path)])
+            return str(output_path)
+        with Delivery(output_path, only_existing=True) as delivery:
+            written = delivery.begin()
+            self.run_command([*cmd, written])
+            delivery.publish()
+        return written
+
     def _compose(self, inputs: dict[str, Any]) -> ToolResult:
         """FFmpeg composition: concat video cuts, add audio, burn subtitles.
 
@@ -744,8 +791,7 @@ class VideoCompose(BaseTool):
             else:
                 cmd.extend(["-c:a", "copy"])
 
-            cmd.append(str(output_path))
-            self.run_command(cmd)
+            written = self._run_ffmpeg_to(cmd, output_path)
 
             from lib.gpu import telemetry as gpu_telemetry
 
@@ -760,7 +806,7 @@ class VideoCompose(BaseTool):
                     "output": str(output_path),
                     # Which backend actually encoded each step (hardware
                     # encoder or CPU fallback), from the execution log.
-                    "gpu_execution": gpu_telemetry.for_outputs(gpu_t0, [temp_dir, output_path]),
+                    "gpu_execution": gpu_telemetry.for_outputs(gpu_t0, [temp_dir, output_path, written]),
                 },
                 artifacts=[str(output_path)],
             )
@@ -1102,7 +1148,11 @@ class VideoCompose(BaseTool):
             # hardware encoder, with automatic CPU fallback (lib.gpu.remotion).
             gpu_execution = remotion_gpu.run_render(
                 cmd, cwd=composer_dir, timeout=1800, runner=self.run_command,
+                output=output_path,
+                finalize=self._audio_finalizer(inputs["audio_path"]) if inputs.get("audio_path") else None,
             )
+        except VideoCompose._PostRenderFailure as pf:
+            return pf.result
         except Exception as e:
             return ToolResult(success=False, error=f"Atelier (bespoke) Remotion render failed: {e}")
 
@@ -1111,11 +1161,6 @@ class VideoCompose(BaseTool):
                 success=False,
                 error=f"Atelier render completed but output file missing: {output_path}",
             )
-
-        if inputs.get("audio_path"):
-            mux_result = self._mux_external_audio(output_path, inputs["audio_path"])
-            if not mux_result.success:
-                return mux_result
 
         # --- Atelier post-render review -------------------------------------
         # The cut-schema paths run _run_final_review (technical/visual/audio
@@ -1727,11 +1772,18 @@ class VideoCompose(BaseTool):
                 remotion_inputs["remotion_timeout_ms"] = inputs["remotion_timeout_ms"]
             if inputs.get("public_dir") is not None:
                 remotion_inputs["public_dir"] = inputs["public_dir"]
-            render_result = self._remotion_render(remotion_inputs)
+            # The approved mix is muxed in as part of the delivery (before the
+            # render is published over an existing file), not after it.
+            finalizer = {}
+            if inputs.get("audio_path"):
+                finalizer["finalize"] = self._audio_finalizer(inputs["audio_path"])
+            render_result = self._remotion_render(remotion_inputs, **finalizer)
 
             # Governance: NEVER silently fall back to FFmpeg when Remotion fails.
             # The agent must decide the fallback path, not the tool.
             if not render_result.success:
+                if render_result.data.get("post_render_failure"):
+                    return render_result  # e.g. the audio mux failed: report that, not a renderer failure
                 renderer_family = edit_decisions.get("renderer_family", "unknown")
                 return ToolResult(
                     success=False,
@@ -1747,9 +1799,6 @@ class VideoCompose(BaseTool):
                     ),
                 )
             if inputs.get("audio_path"):
-                mux_result = self._mux_external_audio(output_path, inputs["audio_path"])
-                if not mux_result.success:
-                    return mux_result
                 render_result.data["has_mixed_audio"] = True
         else:
             # --- FFmpeg fallback: only when Remotion is unavailable ---
@@ -1998,7 +2047,7 @@ class VideoCompose(BaseTool):
 
         return render_result
 
-    def _remotion_render(self, inputs: dict[str, Any]) -> ToolResult:
+    def _remotion_render(self, inputs: dict[str, Any], finalize=None) -> ToolResult:
         """Render via Remotion (requires Node.js + npx).
 
         Handles compositions with still images, animated scenes, component
@@ -2154,7 +2203,10 @@ class VideoCompose(BaseTool):
             # render is retried on the CPU path (lib.gpu.remotion).
             gpu_execution = remotion_gpu.run_render(
                 cmd, cwd=composer_dir, timeout=subprocess_timeout, runner=self.run_command,
+                output=output_path, finalize=finalize,
             )
+        except VideoCompose._PostRenderFailure as pf:
+            return pf.result
         except subprocess.CalledProcessError as e:
             # run_command uses check=True + capture_output, so the useful
             # Remotion diagnostics live in stderr/stdout — surface the tail
@@ -2793,10 +2845,9 @@ class VideoCompose(BaseTool):
             "-vf", f"subtitles='{sub_escaped}':force_style='{ass_style}'",
             "-c:v", codec, "-crf", str(crf),
             "-c:a", "copy",
-            str(output_path),
         ]
 
-        self.run_command(cmd)
+        self._run_ffmpeg_to(cmd, output_path)
 
         return ToolResult(
             success=True,
@@ -2863,9 +2914,8 @@ class VideoCompose(BaseTool):
         cmd.extend(["-filter_complex", filter_complex])
         cmd.extend(["-map", f"[{prev_label}]", "-map", "0:a?"])
         cmd.extend(["-c:v", codec, "-crf", str(crf), "-c:a", "copy"])
-        cmd.append(str(output_path))
 
-        self.run_command(cmd)
+        self._run_ffmpeg_to(cmd, output_path)
 
         return ToolResult(
             success=True,
@@ -2906,8 +2956,7 @@ class VideoCompose(BaseTool):
             except (ImportError, ValueError):
                 pass  # proceed without profile
 
-        cmd.append(str(output_path))
-        self.run_command(cmd)
+        self._run_ffmpeg_to(cmd, output_path)
 
         return ToolResult(
             success=True,

@@ -32,6 +32,20 @@ numbered pattern or a multi-file muxer) makes it refuse the whole command before
 anything runs, rather than leave an unowned writer on a production asset. When
 staging cannot be guaranteed for an existing output without ``-y``, the original
 command is exec'd directly so ffmpeg's own refuse/prompt semantics are preserved.
+
+Destinations are resolved the way FFmpeg opens them: a ``file:`` URL names the
+same file as the plain path, a symlink is followed to the file it writes, and a
+muxer inferred from the extension (``.m3u8``) is the same multi-file muxer as the
+explicit ``-f hls``. A command with nothing to accelerate is still not allowed to
+destroy a production asset: when it would overwrite an existing regular file it
+runs as an owned child writing a staged temp that replaces the file only after
+it succeeded (``_run_cpu_owned``); otherwise it is exec'd with zero overhead.
+
+A hardware encode is published only if the finished file shows what the command
+asked for (codec family, 8-bit 4:2:0): a translation that FFmpeg's option
+ordering turned into something else (``_validate``) is treated as a failed
+hardware attempt, and the telemetry names the backend that really produced the
+published file.
 """
 from __future__ import annotations
 
@@ -48,22 +62,41 @@ Path = None  # type: ignore
 Optional = None  # type: ignore
 
 
-def _load() -> None:
-    global json, shutil, signal, subprocess, time, runtime, telemetry, Path
-    if runtime is not None:
+def _load_proc() -> None:
+    """Import only what running an owned child needs (imports are slow under proot)."""
+    global signal, subprocess
+    if subprocess is not None:
+        return
+    import signal as _signal
+    import subprocess as _subprocess
+
+    signal, subprocess = _signal, _subprocess
+
+
+def _load_light() -> None:
+    """Import what validating and publishing a file needs, without the runtime probe."""
+    global json, shutil, time, Path
+    _load_proc()
+    if json is not None:
         return
     import json as _json
     import shutil as _shutil
-    import signal as _signal
-    import subprocess as _subprocess
     import time as _time
     from pathlib import Path as _Path
+
+    json, shutil, time, Path = _json, _shutil, _time, _Path
+
+
+def _load() -> None:
+    global runtime, telemetry
+    if runtime is not None:
+        return
+    _load_light()
 
     from lib.gpu import runtime as _runtime
     from lib.gpu import telemetry as _telemetry
 
-    json, shutil, signal, subprocess, time = _json, _shutil, _signal, _subprocess, _time
-    runtime, telemetry, Path = _runtime, _telemetry, _Path
+    runtime, telemetry = _runtime, _telemetry
 
 _SHIM_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
                          "gpu_native", "shims", "path")
@@ -132,17 +165,32 @@ def _write_err(data: bytes) -> None:
         pass
 
 
+# What the last ``_validate`` saw in each verified file (path -> "codec/pix_fmt"),
+# for the telemetry of the attempt that published it.
+_VERIFIED: dict = {}
+
+
 def _validate(outputs: list) -> "str | None":
     """Return an error string if any produced file is unusable.
 
-    ``outputs`` is a list of ``(path, kind)`` pairs. ``kind`` selects the check
-    that matches the output's media type: ``"video"`` requires a video stream
-    with dimensions (every output produced by a video encode, hardware or CPU),
-    ``"media"`` requires at least one stream (audio, image, stream copy or a
-    mixed muxer), and ``"file"`` only requires a non-empty file (text, checksum
-    and metadata muxers carry no media stream to probe).
+    ``outputs`` is a list of ``(path, kind)`` or ``(path, kind, expect)``
+    entries. ``kind`` selects the check that matches the output's media type:
+    ``"video"`` requires a video stream with dimensions (every output produced
+    by a video encode, hardware or CPU), ``"media"`` requires at least one
+    stream (audio, image, stream copy or a mixed muxer), and ``"file"`` only
+    requires a non-empty file (text, checksum and metadata muxers carry no
+    media stream to probe).
+
+    ``expect`` (hardware-encoded outputs) is the contract the command asked
+    for: the codec family and an 8-bit 4:2:0 pixel format. Every video stream
+    of the finished file must show it, so a translation that FFmpeg's option
+    ordering or scoping turned into a stream copy, another codec or another
+    pixel format is caught here -- before anything is published -- instead of
+    being reported as a hardware encode.
     """
-    for path, kind in outputs:
+    for entry in outputs:
+        path, kind = entry[0], entry[1]
+        expect = entry[2] if len(entry) > 2 else None
         p = Path(path)
         if not p.is_file() or p.stat().st_size == 0:
             return f"output missing or empty: {path}"
@@ -150,8 +198,9 @@ def _validate(outputs: list) -> "str | None":
             continue
         probe = ["ffprobe", "-v", "error"]
         if kind == "video":
-            probe += ["-select_streams", "v:0"]
-        probe += ["-show_entries", "stream=codec_type,codec_name,width,height:format=duration",
+            probe += ["-select_streams", "v" if expect else "v:0"]
+        probe += ["-show_entries",
+                  "stream=codec_type,codec_name,pix_fmt,width,height:stream_disposition=attached_pic:format=duration",
                   "-of", "json", path]
         try:
             proc = subprocess.run(probe, capture_output=True, text=True, timeout=60, env=_cpu_env())
@@ -160,18 +209,47 @@ def _validate(outputs: list) -> "str | None":
             return f"ffprobe failed on {path}: {exc}"
         streams = data.get("streams") or []
         if kind == "video":
+            if expect:
+                # Cover art (attached pictures) is not part of the video encode.
+                streams = [s for s in streams if not (s.get("disposition") or {}).get("attached_pic")]
             if not streams:
                 return f"no video stream in {path}"
             if not streams[0].get("width"):
                 return f"video stream without dimensions in {path}"
+            if expect:
+                for st in streams:
+                    codec, pix = st.get("codec_name"), st.get("pix_fmt")
+                    if codec != expect["codec"] or pix not in expect["pix_fmts"]:
+                        return (f"output contract mismatch in {path}: video stream is {codec}/{pix}, "
+                                f"expected {expect['codec']}/{expect['pix_fmts'][0]} "
+                                f"({expect['encoder']} was requested but did not produce it)")
+                _VERIFIED[path] = f"{streams[0].get('codec_name')}/{streams[0].get('pix_fmt')}"
         elif not streams:
             return f"no media stream in {path}"
     return None
 
 
-def _staged_media(pairs: list, media: dict) -> list:
-    """Pair each staged temp with the validation strength of its destination."""
-    return [(temp, media.get(final, "media")) for final, temp in pairs]
+def _name_finals(problem: "str | None", pairs: list) -> "str | None":
+    """Say ``out.mp4`` where a validation message names its staged temp."""
+    if problem:
+        for final, temp in pairs:
+            problem = problem.replace(temp, final)
+    return problem
+
+
+def _staged_media(pairs: list, media: dict, expect: "dict | None" = None) -> list:
+    """Pair each staged temp with the validation strength of its destination.
+
+    ``expect`` maps a final path to the output contract its hardware encode
+    must satisfy (see :func:`_validate`).
+    """
+    out = []
+    for final, temp in pairs:
+        entry = (temp, media.get(final, "media"))
+        if expect and expect.get(final):
+            entry += (expect[final],)
+        out.append(entry)
+    return out
 
 
 def _declared_media(paths: list, media: dict) -> list:
@@ -218,7 +296,8 @@ class _CannotStage(Exception):
 
     ``kind`` distinguishes a destination ffmpeg itself would refuse to write
     (``"overwrite"``: an existing target with no ``-y``) from one that cannot be
-    identified in the command line at all (``"absent"``).
+    identified in the command line at all (``"absent"``) and from one whose
+    directory does not let a sibling temp be created (``"unstageable"``).
     """
 
     def __init__(self, message: str, kind: str = "absent"):
@@ -244,24 +323,39 @@ def _locate_output(cmd: list, final: str) -> "int | None":
 
 
 def _stage_cmd(cmd: list, targets: list, *, has_y: bool) -> "tuple[list, list]":
-    """Redirect every non-pipe ``targets`` entry to a fresh sibling temp.
+    """Redirect every local-file ``targets`` entry to a fresh sibling temp.
 
-    Returns ``(staged_cmd, [(final, temp), ...])`` or raises ``_CannotStage``
-    when ownership cannot be guaranteed: an existing output without ``-y``
-    (ffmpeg's refuse/prompt semantics must be preserved) or a target that does
-    not appear as an output token. Callers pass *every* file output of the
-    command, so one transaction owns the command's complete output surface.
+    ``targets`` are output *tokens* exactly as they appear in ``cmd`` (a plain
+    path or a ``file:`` URL). Returns ``(staged_cmd, [(final, temp), ...])``
+    where ``final`` is the file the token really writes (``file:`` stripped,
+    a symlink followed) and ``temp`` replaces the token in the staged command.
+    Raises ``_CannotStage`` when ownership cannot be guaranteed: an existing
+    output without ``-y`` (ffmpeg's refuse/prompt semantics must be preserved),
+    a directory that cannot hold a sibling temp, or a target that does not
+    appear as an output token. Callers pass *every* file output of the command,
+    so one transaction owns the command's complete output surface.
     """
     staged = list(cmd)
     pairs = []
-    for final in targets:
-        if ffmpeg_args.is_pipe(final):
+    for token in targets:
+        if ffmpeg_args.is_pipe(token):
             continue
+        path = ffmpeg_args.local_path(token)
+        if path is None:
+            continue  # a network/other target: nothing on disk to stage
+        final = ffmpeg_args.write_target(path)
         if not has_y and os.path.exists(final):
             raise _CannotStage(f"{final} exists and the command has no -y", "overwrite")
-        idx = _locate_output(staged, final)
+        parent = os.path.dirname(final) or "."
+        if os.path.isdir(parent) and not os.access(parent, os.W_OK | os.X_OK):
+            # The file may be writable in place while its directory is not: a
+            # sibling temp cannot be created, so the destination cannot be
+            # owned. (A *missing* directory is not a hazard: nothing can be
+            # written there and the encoder reports the error itself.)
+            raise _CannotStage(f"cannot create a staging file beside {final}", "unstageable")
+        idx = _locate_output(staged, token)
         if idx is None:
-            raise _CannotStage(f"output token not found in command: {final}", "absent")
+            raise _CannotStage(f"output token not found in command: {token}", "absent")
         temp = _temp_path(final)
         staged[idx] = temp
         pairs.append((final, temp))
@@ -472,9 +566,11 @@ def _owned_signal(signum, _frame) -> None:
 
 
 def _install_cancel_handlers() -> None:
-    _load()
+    _load_proc()
     _OWNED["signum"] = 0
     _OWNED["stopped"] = None
+    if _OWNED.get("saved"):
+        return  # already installed (an owned run nested in an owned dispatch)
     _OWNED["saved"] = {s: signal.signal(s, _owned_signal)
                        for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
 
@@ -571,6 +667,81 @@ def _run_native(cmd: list[str], *, capture_stderr: bool, allow_remote: bool = Tr
     return _run_owned(cmd, runtime.native_env(), capture_stderr=capture_stderr)
 
 
+def _check_written(pairs: list) -> "str | None":
+    """An owned plain command succeeded: every staged file must really exist."""
+    for final, temp in pairs:
+        try:
+            if not os.path.isfile(temp) or os.path.getsize(temp) == 0:
+                return f"output missing or empty: {final}"
+        except OSError:
+            return f"output missing or empty: {final}"
+    return None
+
+
+def _run_cpu_owned(cpu_cmd: list, ownership: list) -> int:
+    """Run a command with nothing to accelerate, without letting it destroy an asset.
+
+    The original command runs unmodified on the CPU FFmpeg, but every file it
+    writes is redirected to a fresh sibling temp and replaces its destination
+    only after the command succeeded (all-or-nothing, like the accelerated
+    path). A failure, a kill or a cancellation therefore leaves every
+    pre-existing file exactly as it was. stdin/stdout/stderr stay attached to
+    the caller, and the exit status (or fatal signal) is passed through.
+    """
+    _load_proc()
+    file_outs = [o for o in ownership if o.kind == "file"]
+    try:
+        run_cmd, pairs = _stage_cmd(cpu_cmd, [o.target for o in file_outs], has_y=True)
+    except _CannotStage:
+        # Ownership cannot be established (no room for a sibling temp, an
+        # unlocatable token): run the original command exactly as before.
+        _exec(cpu_cmd, _cpu_env())
+    _install_cancel_handlers()
+    try:
+        rc, _ = _run_owned(run_cmd, _cpu_env(), capture_stderr=False)
+        if _cancelled():
+            _discard_outputs(pairs)
+            return _die_by_signal(_cancelled())
+        if rc < 0:  # the encoder itself was killed: fail the way a direct run would
+            _discard_outputs(pairs)
+            return _die_by_signal(-rc)
+        if rc != 0:
+            _discard_outputs(pairs)
+            return rc
+        problem = _check_written(pairs)
+        if problem is None:
+            problem = _commit_outputs(pairs)
+        if problem is not None:
+            _discard_outputs(pairs)
+            sys.stderr.write(f"[openmontage-gpu] could not publish output; existing files left untouched: "
+                             f"{problem}\n")
+            return 1
+        return 0
+    finally:
+        _restore_cancel_handlers()
+
+
+def _passthrough(argv: list, cpu_cmd: list) -> int:
+    """Run a command the dispatcher does not accelerate.
+
+    It is exec'd with no overhead -- unless it would overwrite an existing
+    regular file (``-y`` over a production asset), in which case it runs owned
+    (:func:`_run_cpu_owned`). A command whose outputs cannot all be owned (a
+    numbered pattern, a multi-file muxer, ...) is exactly as it always was.
+    """
+    if "-y" in argv:
+        parsed = ffmpeg_args.parse(argv)
+        # One stat per output decides whether there is anything to protect;
+        # only then is the full ownership classification worth computing.
+        if parsed.ok and any(os.path.isfile(ffmpeg_args.local_path(seg.target) or "") for seg in parsed.outputs):
+            ownership = ffmpeg_args.own_outputs(argv)
+            if ownership and not any(o.kind == "unsafe" for o in ownership) \
+                    and any(o.kind == "file" and os.path.isfile(o.path) for o in ownership):
+                return _run_cpu_owned(cpu_cmd, ownership)
+    _exec(cpu_cmd, _cpu_env())  # never returns
+    return 0
+
+
 def dispatch(argv: list[str]) -> int:
     """Run one ffmpeg command line (``argv`` excludes the program name)."""
     cpu_cmd = [real_ffmpeg(), *argv]
@@ -583,7 +754,7 @@ def dispatch(argv: list[str]) -> int:
     # pay for (or depend on) the hardware capability probe.
     gpu_argv, plans = ffmpeg_args.translate(argv, available={"h264", "hevc"})
     if gpu_argv is None and not any(p.action == "cpu" for p in plans):
-        _exec(cpu_cmd, _cpu_env())  # nothing to accelerate: zero-import fast path
+        return _passthrough(argv, cpu_cmd)  # nothing to accelerate: zero-import fast path
     _load()
     t0 = time.time()
     if gpu_argv is not None:
@@ -601,7 +772,7 @@ def dispatch(argv: list[str]) -> int:
             if mode == "require":
                 sys.stderr.write(f"[openmontage-gpu] OM_GPU_MODE=require but no hardware path: {reasons}\n")
                 return 69
-        _exec(cpu_cmd, _cpu_env())
+        return _passthrough(argv, cpu_cmd)
 
     gpu_plans = [p for p in plans if p.action == "gpu"]
     codec = gpu_plans[0].hw_codec
@@ -637,7 +808,44 @@ def dispatch(argv: list[str]) -> int:
         telemetry.record({"kind": "job", "op": "ffmpeg", "backend": "cpu",
                           "fallback_reason": "hardware encoder backend unhealthy (recent failures)",
                           "output": ",".join(p.target for p in gpu_plans)})
-        _exec(cpu_cmd, _cpu_env())
+        return _passthrough(argv, cpu_cmd)
+
+    # The complete output contract of the command, not only the translated
+    # video outputs: every file the command writes must be owned by an
+    # attempt, or the command must not run at all. An output the dispatcher
+    # cannot own (a numbered pattern, a multi-file muxer -- explicit or
+    # inferred from the extension --, a sidecar-writing option, an output that
+    # is also an input) is refused *before* anything runs, never left to an
+    # unowned writer.
+    ownership = ffmpeg_args.own_outputs(argv)
+    unownable = [o for o in ownership if o.kind == "unsafe"]
+    if unownable:
+        detail = "; ".join(f"{o.target} ({o.reason})" for o in unownable)
+        sys.stderr.write("[openmontage-gpu] refusing to run: cannot take ownership of every "
+                         f"file output ({detail}); nothing was written\n")
+        telemetry.record({"kind": "job", "op": "ffmpeg", "backend": "gpu-failed",
+                          "fallback_reason": f"unownable file output: {detail}",
+                          "output": ",".join(o.target for o in unownable)})
+        return 78
+    file_outs = [o for o in ownership if o.kind == "file"]
+    file_tokens = [o.target for o in file_outs]          # as written on the command line
+    file_paths = [o.path for o in file_outs]             # the files they really write
+    media = {o.path: o.media for o in file_outs}
+    path_of = {o.target: o.path for o in file_outs}
+    expect = {path_of[p.target]: p.expect for p in gpu_plans
+              if getattr(p, "expect", None) and p.target in path_of}
+    software_outputs = [p.target for p in plans if p.action == "cpu"]
+
+    def _job_event(backend: str, **extra) -> dict:
+        """Telemetry of this job: the backend that really ran, per-output facts."""
+        encoders = sorted({f"{p.hw_codec}_mediacodec" for p in gpu_plans})
+        devices = sorted({(runtime.hw_encoder(p.hw_codec) or {}).get("component") or ""
+                          for p in gpu_plans} - {""})
+        ev = {"kind": "job", "op": "ffmpeg", "backend": backend,
+              "encoder": ",".join(encoders), "device": ",".join(devices) or enc.get("component"),
+              "output": ",".join(p.target for p in gpu_plans)}
+        ev.update(extra)
+        return ev
 
     slots = int(os.environ.get("OM_GPU_ENCODER_SLOTS") or min(4, int(enc.get("max_instances") or 4)))
     # From here on the dispatcher owns subprocesses and is the only thing that
@@ -654,27 +862,7 @@ def dispatch(argv: list[str]) -> int:
                 telemetry.record({"kind": "job", "op": "ffmpeg", "backend": "cpu",
                                   "fallback_reason": "all hardware encoder slots busy",
                                   "output": ",".join(p.target for p in gpu_plans)})
-                _exec(cpu_cmd, _cpu_env())
-
-            # The complete output contract of the command, not only the
-            # translated video outputs: every file the command writes must be
-            # owned by an attempt, or the command must not run at all. An
-            # output the dispatcher cannot own (a numbered pattern or a
-            # multi-file muxer) is refused *before* anything runs, never left to
-            # an unowned writer.
-            ownership = ffmpeg_args.own_outputs(argv)
-            unownable = [o for o in ownership if o.kind == "unsafe"]
-            if unownable:
-                detail = "; ".join(f"{o.target} ({o.reason})" for o in unownable)
-                sys.stderr.write("[openmontage-gpu] refusing to run: cannot take ownership of every "
-                                 f"file output ({detail}); nothing was written\n")
-                telemetry.record({"kind": "job", "op": "ffmpeg", "backend": "gpu-failed",
-                                  "fallback_reason": f"unownable file output: {detail}",
-                                  "output": ",".join(o.target for o in unownable)})
-                return 78
-            file_outs = [o for o in ownership if o.kind == "file"]
-            file_outputs = [o.target for o in file_outs]
-            media = {o.target: o.media for o in file_outs}
+                return _passthrough(argv, cpu_cmd)
 
             if streaming:
                 # A consumed pipe cannot be replayed, so the hardware run has no
@@ -682,17 +870,21 @@ def dispatch(argv: list[str]) -> int:
                 # failed or cancelled run cannot leave a half-written production
                 # file behind; the pipes themselves are never staged.
                 try:
-                    run_cmd, staged_pairs = _stage_cmd(native_cmd, file_outputs,
+                    run_cmd, staged_pairs = _stage_cmd(native_cmd, file_tokens,
                                                        has_y="-y" in native_cmd)
                 except _CannotStage as exc:
-                    return _unowned_staging(exc, cpu_cmd, file_outputs)
+                    return _unowned_staging(exc, cpu_cmd, file_tokens)
                 rc, _ = _run_native(run_cmd, capture_stderr=False, allow_remote=False)
                 if _cancelled():
                     _discard_outputs(staged_pairs)
                     return _die_by_signal(_cancelled())
+                verified = {}
                 if rc == 0 and staged_pairs:
-                    problem = _validate(_staged_media(staged_pairs, media))
+                    _VERIFIED.clear()
+                    problem = _name_finals(_validate(_staged_media(staged_pairs, media, expect)), staged_pairs)
                     if problem is None:
+                        verified = {final: _VERIFIED.get(temp) for final, temp in staged_pairs
+                                    if _VERIFIED.get(temp)}
                         problem = _commit_outputs(staged_pairs)
                     if problem is not None:
                         _discard_outputs(staged_pairs)
@@ -702,22 +894,22 @@ def dispatch(argv: list[str]) -> int:
                 else:
                     _discard_outputs(staged_pairs)
                 runtime.record_outcome(BACKEND, rc == 0, f"exit {rc}")
-                telemetry.record({"kind": "job", "op": "ffmpeg", "backend": "gpu" if rc == 0 else "gpu-failed",
-                                  "encoder": f"{codec}_mediacodec", "device": enc.get("component"),
-                                  "streaming": True, "rc": rc, "wall_s": round(time.time() - t0, 3),
-                                  "output": ",".join(p.target for p in gpu_plans)})
+                telemetry.record(_job_event("gpu" if rc == 0 else "gpu-failed", streaming=True, rc=rc,
+                                            wall_s=round(time.time() - t0, 3),
+                                            **({"verified": verified} if verified else {}),
+                                            **({"software_outputs": software_outputs} if software_outputs else {})))
                 return rc
 
-            before = _snapshot(file_outputs)
-            if file_outputs:
+            before = _snapshot(file_paths)
+            if file_tokens:
                 # Stage every file output to per-attempt temps: a failed or
                 # orphaned encoder writes temp paths, never the user's finals,
                 # and a retry uses fresh temps rather than racing a live writer.
                 try:
-                    run_cmd, staged_pairs = _stage_cmd(native_cmd, file_outputs,
+                    run_cmd, staged_pairs = _stage_cmd(native_cmd, file_tokens,
                                                        has_y="-y" in native_cmd)
                 except _CannotStage as exc:
-                    return _unowned_staging(exc, cpu_cmd, file_outputs)
+                    return _unowned_staging(exc, cpu_cmd, file_tokens)
             else:
                 # Nothing on disk to protect (pipe outputs only).
                 run_cmd, staged_pairs = native_cmd, []
@@ -742,10 +934,14 @@ def dispatch(argv: list[str]) -> int:
             if _cancelled():
                 _discard_outputs(staged_pairs)
                 return _die_by_signal(_cancelled())
-            produced = _staged_media(staged_pairs, media) if staged_pairs \
-                else _declared_media(file_outputs, media)
-            problem = f"native ffmpeg exit {rc}" if rc != 0 else _validate(produced)
+            produced = _staged_media(staged_pairs, media, expect) if staged_pairs \
+                else _declared_media(file_paths, media)
+            _VERIFIED.clear()
+            problem = f"native ffmpeg exit {rc}" if rc != 0 else _name_finals(_validate(produced), staged_pairs)
             publish_failed = False
+            verified = {}
+            if problem is None:
+                verified = {final: _VERIFIED.get(temp) for final, temp in staged_pairs if _VERIFIED.get(temp)}
             if problem is None and staged_pairs:
                 problem = _commit_outputs(staged_pairs)
                 publish_failed = problem is not None
@@ -755,11 +951,10 @@ def dispatch(argv: list[str]) -> int:
         if problem is None:
             runtime.record_outcome(BACKEND, True)
             _write_err(err)
-            telemetry.record({"kind": "job", "op": "ffmpeg", "backend": "gpu",
-                              "encoder": f"{codec}_mediacodec", "device": enc.get("component"),
-                              "oop": OOP_LAST, "text_render": text_render,
-                              "rc": 0, "wall_s": round(time.time() - t0, 3),
-                              "output": ",".join(p.target for p in gpu_plans)})
+            telemetry.record(_job_event("gpu", oop=OOP_LAST, text_render=text_render, rc=0,
+                                        wall_s=round(time.time() - t0, 3),
+                                        **({"verified": verified} if verified else {}),
+                                        **({"software_outputs": software_outputs} if software_outputs else {})))
             return 0
 
         tail = err.decode("utf-8", "replace").strip().splitlines()[-4:]
@@ -786,16 +981,16 @@ def dispatch(argv: list[str]) -> int:
             return rc or 1
 
         # Remove what the failed GPU attempt wrote so the CPU run starts clean.
-        _remove_partial(file_outputs, before)
+        _remove_partial(file_paths, before)
         # The fallback obeys exactly the same ownership contract as the hardware
         # attempt, over the same complete set of file outputs: its own fresh
         # temps, its own owned process group, and a publish only after it
         # completes and validates.
-        if file_outputs:
+        if file_tokens:
             try:
-                cpu_run, cpu_pairs = _stage_cmd(cpu_cmd, file_outputs, has_y="-y" in cpu_cmd)
+                cpu_run, cpu_pairs = _stage_cmd(cpu_cmd, file_tokens, has_y="-y" in cpu_cmd)
             except _CannotStage as exc:
-                return _unowned_staging(exc, cpu_cmd, file_outputs)
+                return _unowned_staging(exc, cpu_cmd, file_tokens)
         else:
             cpu_run, cpu_pairs = cpu_cmd, []
         rc2, err2 = _run_owned(cpu_run, _cpu_env(), capture_stderr=True)
@@ -805,7 +1000,7 @@ def dispatch(argv: list[str]) -> int:
         cpu_problem = f"cpu ffmpeg exit {rc2}" if rc2 != 0 else None
         if cpu_problem is None:
             cpu_problem = _validate(_staged_media(cpu_pairs, media) if cpu_pairs
-                                    else _declared_media(file_outputs, media))
+                                    else _declared_media(file_paths, media))
         if cpu_problem is None and cpu_pairs:
             cpu_problem = _commit_outputs(cpu_pairs)
         if cpu_problem is not None:

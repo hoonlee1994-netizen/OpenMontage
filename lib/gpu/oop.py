@@ -298,6 +298,16 @@ class OopResult:
         self.error = error
 
 
+def _lost(wall_ms: int = 0) -> OopResult:
+    """The connection died after the request may have reached the worker.
+
+    Unlike "no worker" (``None``: nothing was sent, the caller may reuse its
+    target) the command may have started and may still be writing, so the
+    caller must treat its output path as taken and give the fallback a fresh one.
+    """
+    return OopResult(-1, b"", b"", wall_ms, "connection lost after the request was sent; the command may have started")
+
+
 def _call(req: dict, timeout: float) -> "OopResult | None":
     s = _connect(min(timeout, 10.0))
     if s is None:
@@ -310,14 +320,14 @@ def _call(req: dict, timeout: float) -> "OopResult | None":
         while len(head) < 4:
             chunk = s.recv(4 - len(head))
             if not chunk:
-                return None
+                return _lost()
             head += chunk
         (size,) = struct.unpack(">I", head)
         buf = bytearray()
         while len(buf) < size:
             chunk = s.recv(min(_CHUNK, size - len(buf)))
             if not chunk:
-                return None
+                return _lost()
             buf += chunk
         data = json.loads(bytes(buf).decode("utf-8"))
         return OopResult(
@@ -328,7 +338,7 @@ def _call(req: dict, timeout: float) -> "OopResult | None":
             data.get("error"),
         )
     except Exception:
-        return None
+        return _lost()
     finally:
         try:
             s.close()

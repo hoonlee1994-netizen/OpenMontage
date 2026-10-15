@@ -73,7 +73,8 @@ def summarize(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
         counts[backend] = counts.get(backend, 0) + 1
         jobs.append({
             k: ev.get(k) for k in
-            ("op", "backend", "device", "encoder", "fallback_reason", "wall_s", "output")
+            ("op", "backend", "device", "encoder", "fallback_reason", "wall_s", "output",
+             "verified", "software_outputs")
             if ev.get(k) is not None
         })
     return {"by_backend": counts, "jobs": jobs[-50:]}
